@@ -3,9 +3,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any, Dict, List, Optional
 
 
+class PackingStrategy(str, Enum):
+    """Strategy for distributing workloads across compute instances."""
+    BALANCE = "balance"          # Water-filling: equalize remaining quota / usage across instances (DEFAULT)
+    CONCENTRATE = "concentrate"  # Minimal instances: pack onto fewest nodes to keep instances untouched
 @dataclass
 class Job:
     """A computational unit of work to be scheduled on an accelerator."""

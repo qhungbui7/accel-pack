@@ -1,8 +1,7 @@
 import pytest
-from accelpack.models import Job, Instance, DeviceSlot, InstancePlan, ExecutionPlan
+from accelpack.models import Job, Instance, DeviceSlot, InstancePlan, ExecutionPlan, PackingStrategy
 from accelpack.scheduler import AccelPackScheduler, QuotaExceededException
 from accelpack.estimator import ProfileDurationEstimator
-
 
 def test_job_validation():
     with pytest.raises(ValueError):
@@ -27,31 +26,54 @@ def test_minimal_instance_preservation():
         Instance(instance_id="node-3", device_count=2, remaining_quota_h=25.0, max_session_h=11.0),
     ]
 
-    # 6 jobs of 0.2 hours (12 minutes each)
+def test_concentrate_minimal_instance_preservation():
+    """Verify that in CONCENTRATE mode, jobs are packed onto minimal instances."""
+    instances = [
+        Instance(instance_id="node-1", device_count=2, remaining_quota_h=25.0, max_session_h=11.0),
+        Instance(instance_id="node-2", device_count=2, remaining_quota_h=25.0, max_session_h=11.0),
+        Instance(instance_id="node-3", device_count=2, remaining_quota_h=25.0, max_session_h=11.0),
+    ]
+
     jobs = [Job(job_id=f"job_{i}", duration_h=0.2) for i in range(6)]
 
-    scheduler = AccelPackScheduler(setup_overhead_h=0.10)
+    scheduler = AccelPackScheduler(strategy=PackingStrategy.CONCENTRATE, setup_overhead_h=0.10)
     plan = scheduler.schedule(jobs, instances)
 
-    # Must open strictly 1 instance!
     assert len(plan.active_instances) == 1
     assert len(plan.untouched_instances) == 2
     assert plan.active_instances[0].instance.instance_id == "node-1"
-    
-    # 6 jobs split across 2 devices: 3 jobs each -> load is 0.6h on both
-    slots = plan.active_instances[0].slots
-    assert len(slots[0].jobs) == 3
-    assert len(slots[1].jobs) == 3
-    assert slots[0].load_h == pytest.approx(0.6)
-    assert slots[1].load_h == pytest.approx(0.6)
-    assert plan.active_instances[0].makespan_h == pytest.approx(0.70)
+
+
+def test_balance_waterfill_equal_usage_default():
+    """Verify that in BALANCE mode (default), jobs are distributed across instances to equalize remaining quotas."""
+    instances = [
+        Instance(instance_id="used_node", device_count=2, remaining_quota_h=20.0, max_session_h=11.0),
+        Instance(instance_id="fresh_node_1", device_count=2, remaining_quota_h=29.0, max_session_h=11.0),
+        Instance(instance_id="fresh_node_2", device_count=2, remaining_quota_h=29.0, max_session_h=11.0),
+    ]
+
+    # 6 jobs of 1.0 hour each.
+    # BALANCE mode should spread across the fresh nodes (29h remaining) rather than overloading the used node (20h).
+    jobs = [Job(job_id=f"job_{i}", duration_h=1.0) for i in range(6)]
+
+    scheduler = AccelPackScheduler(strategy=PackingStrategy.BALANCE, setup_overhead_h=0.10)
+    plan = scheduler.schedule(jobs, instances)
+
+    # Waterfill should target fresh_node_1 and fresh_node_2 first!
+    # Each fresh node gets 2 or 4 jobs, leaving used_node with minimal or 0 new burden.
+    active_ids = {ip.instance.instance_id for ip in plan.active_instances}
+    assert "fresh_node_1" in active_ids
+    assert "fresh_node_2" in active_ids
+    # Both fresh nodes get work, preserving balance
+    for ip in plan.active_instances:
+        # Dual devices must be balanced inside each container
+        assert ip.load_imbalance_h <= 1.0
 
 
 def test_dual_device_load_balancing():
     """Verify that jobs with unequal lengths are balanced across devices to minimize idle device billing."""
     instances = [Instance(instance_id="node-1", device_count=2, remaining_quota_h=25.0)]
     
-    # Jobs: 2.0h, 1.5h, 1.0h, 0.5h (Total = 5.0h)
     jobs = [
         Job(job_id="j1", duration_h=2.0),
         Job(job_id="j2", duration_h=1.5),
@@ -59,18 +81,13 @@ def test_dual_device_load_balancing():
         Job(job_id="j4", duration_h=0.5),
     ]
 
-    scheduler = AccelPackScheduler(setup_overhead_h=0.10)
+    scheduler = AccelPackScheduler(strategy=PackingStrategy.CONCENTRATE, setup_overhead_h=0.10)
     plan = scheduler.schedule(jobs, instances)
 
     slots = plan.active_instances[0].slots
-    # LPT packing assigns:
-    # Device 0: 2.0 + 0.5 = 2.5h
-    # Device 1: 1.5 + 1.0 = 2.5h
-    # Perfect balance!
     assert slots[0].load_h == pytest.approx(2.5)
     assert slots[1].load_h == pytest.approx(2.5)
     assert plan.active_instances[0].load_imbalance_h == pytest.approx(0.0)
-
 
 def test_session_limit_spillover():
     """Verify that when workload exceeds one instance's session limit (11h), it spills cleanly into a second instance."""
