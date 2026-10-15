@@ -39,6 +39,8 @@ class AccelPackScheduler:
         cpu_penalty_weight: float = 0.5,
         max_cpu_oversubscription_ratio: Optional[float] = None,
         enforce_reset_deadline: bool = False,
+        reject_conflicting_account_quotas: bool = False,
+        expand_segments: bool = True,
     ):
         """
         Args:
@@ -54,6 +56,9 @@ class AccelPackScheduler:
             cpu_penalty_weight: Weight applied to CPU oversubscription penalty in scheduling choices.
             max_cpu_oversubscription_ratio: Optional hard ceiling on CPU overcommit. None allows soft preference.
             enforce_reset_deadline: If True, reject placing jobs if makespan crosses instance reset_at timestamp.
+            reject_conflicting_account_quotas: If True, raise exception when instances sharing an account_id
+                                              declare conflicting remaining quotas. If False, normalize to min().
+            expand_segments: If True, split jobs declaring valid checkpoint segments into schedulable sub-jobs.
         """
         self.strategy = strategy
         self.objective = objective
@@ -66,6 +71,65 @@ class AccelPackScheduler:
         self.cpu_penalty_weight = cpu_penalty_weight
         self.max_cpu_oversubscription_ratio = max_cpu_oversubscription_ratio
         self.enforce_reset_deadline = enforce_reset_deadline
+        self.reject_conflicting_account_quotas = reject_conflicting_account_quotas
+        self.expand_segments = expand_segments
+
+    def _normalize_account_quotas(self, instances: List[Instance]) -> List[Instance]:
+        """Ensures every account pool has exactly one authoritative quota balance."""
+        account_groups: Dict[str, List[Instance]] = {}
+        for inst in instances:
+            acc_id = inst.account_id or inst.instance_id
+            account_groups.setdefault(acc_id, []).append(inst)
+
+        normalized: List[Instance] = []
+        for acc_id, inst_list in account_groups.items():
+            quotas = [i.remaining_quota_h for i in inst_list]
+            if max(quotas) - min(quotas) > 1e-4:
+                if self.reject_conflicting_account_quotas:
+                    raise QuotaExceededException(
+                        f"Conflicting quota declarations for account '{acc_id}': {quotas}. "
+                        f"Cannot safely schedule without authoritative quota balance."
+                    )
+                auth_quota = min(quotas)
+            else:
+                auth_quota = quotas[0]
+
+            for inst in inst_list:
+                inst_copy = copy.copy(inst)
+                inst_copy.remaining_quota_h = auth_quota
+                normalized.append(inst_copy)
+
+        return normalized
+
+    def _expand_segmented_jobs(self, jobs: List[Job]) -> List[Job]:
+        """Expands jobs with checkpoint segments into schedulable discrete segment units."""
+        if not self.expand_segments:
+            return jobs
+
+        expanded: List[Job] = []
+        for j in jobs:
+            if j.segments and len(j.segments) > 0:
+                for idx, seg_dur in enumerate(j.segments):
+                    seg_job = Job(
+                        job_id=f"{j.job_id}_seg{idx}",
+                        duration_h=seg_dur,
+                        vram_gb=j.vram_gb,
+                        ram_gb=j.ram_gb,
+                        cpu_cores=j.cpu_cores,
+                        priority=j.priority,
+                        hardware_class=j.hardware_class,
+                        resumable=j.resumable,
+                        metadata={
+                            **j.metadata,
+                            "parent_job_id": j.job_id,
+                            "segment_index": idx,
+                            "total_segments": len(j.segments),
+                        },
+                    )
+                    expanded.append(seg_job)
+            else:
+                expanded.append(j)
+        return expanded
 
     def schedule(
         self,
@@ -87,34 +151,40 @@ class AccelPackScheduler:
                 return ExecutionPlan(instance_plans=[], unassigned_jobs=list(jobs))
             raise QuotaExceededException("No compute instances provided to schedule workload.")
 
-        # 1. Sort jobs based on objective with deterministic tie-breaking
+        # 1. Authoritative account quota normalization
+        normalized_instances = self._normalize_account_quotas(instances)
+
+        # 2. Expand segmented jobs if enabled
+        schedulable_jobs = self._expand_segmented_jobs(jobs)
+
+        # 3. Sort jobs based on objective with deterministic tie-breaking
         if self.objective == ObjectiveMode.MAXIMIZE_WORK:
-            # Sort by priority-weighted duration descending, then priority descending, then duration ascending
+            # Sort by priority-weighted duration descending (knapsack density preference)
             sorted_jobs = sorted(
-                jobs,
+                schedulable_jobs,
                 key=lambda j: (j.priority * j.duration_h, j.priority, -j.duration_h, j.job_id),
                 reverse=True,
             )
         elif self.objective == ObjectiveMode.MAXIMIZE_EFFICIENCY:
-            # Sort to pack densest workloads first to maximize useful work per billed hour
+            # Longest processing jobs first to allow dense slot packing
             sorted_jobs = sorted(
-                jobs,
+                schedulable_jobs,
                 key=lambda j: (j.duration_h, j.priority, j.job_id),
                 reverse=True,
             )
         else:
             # COMPLETE_ALL: Longest Processing Time First (LPT)
             sorted_jobs = sorted(
-                jobs,
+                schedulable_jobs,
                 key=lambda j: (j.duration_h, j.priority, j.job_id),
                 reverse=True,
             )
 
         total_work_h = sum(j.duration_h for j in sorted_jobs)
 
-        # 2. Sort candidate instances by remaining quota descending, preserving stable order on ties
+        # 4. Sort candidate instances by remaining quota descending, preserving stable order on ties
         candidate_instances = sorted(
-            instances,
+            normalized_instances,
             key=lambda inst: inst.remaining_quota_h,
             reverse=True,
         )
@@ -159,6 +229,23 @@ class AccelPackScheduler:
     def _get_account_id(self, inst: Instance) -> str:
         return inst.account_id or inst.instance_id
 
+    def _check_standalone_fit(self, inst: Instance, job: Job) -> bool:
+        """Verifies if job can fit on this instance standalone (hardware class, standalone VRAM/RAM)."""
+        # Hardware class compatibility
+        if job.hardware_class is not None:
+            if job.hardware_class.strip().lower() != inst.hardware_class.strip().lower():
+                return False
+
+        # Standalone VRAM ceiling
+        if (job.vram_gb + self.safety_vram_margin_gb) > inst.vram_per_device_gb:
+            return False
+
+        # Standalone RAM ceiling
+        if (job.ram_gb + self.safety_ram_margin_gb) > inst.host_ram_gb:
+            return False
+
+        return True
+
     def _compute_hypothetical_state(
         self,
         ip: InstancePlan,
@@ -172,7 +259,6 @@ class AccelPackScheduler:
         dev_loads: Dict[int, float] = {}
 
         for d in range(inst.device_count):
-            # Calculate active workers on device d after adding job
             workers = 0
             for s in ip.slots:
                 if s.device_index == d:
@@ -192,7 +278,7 @@ class AccelPackScheduler:
         makespan = max(dev_loads.values(), default=0.0) + self.setup_overhead_h
         billed = inst.debit_rate * makespan
 
-        # CPU oversubscription estimate
+        # Aggregate CPU oversubscription estimate
         peak_cpu = 0.0
         for s in ip.slots:
             slot_cpu = max(s.peak_cpu_cores, job.cpu_cores) if s is candidate_slot else s.peak_cpu_cores
@@ -205,20 +291,31 @@ class AccelPackScheduler:
         return dev_loads, makespan, billed, cpu_ratio, cpu_penalty
 
     def _check_reset_deadline(self, inst: Instance, hypothetical_makespan: float) -> bool:
-        """Returns True if schedule respects quota reset deadline."""
+        """Returns True if schedule respects quota reset deadline. Fails safe (False) on invalid/stale timestamps."""
         if not (self.enforce_reset_deadline or inst.must_finish_before_reset):
             return True
+
         if not inst.reset_at:
-            return True
+            # Enforcement requested but reset_at is missing -> Fail safe
+            return False
+
         try:
             reset_dt = datetime.fromisoformat(inst.reset_at.replace("Z", "+00:00"))
             now_dt = datetime.now(timezone.utc)
             hours_to_reset = (reset_dt - now_dt).total_seconds() / 3600.0
-            if hours_to_reset > 0 and hypothetical_makespan > hours_to_reset:
+
+            # If reset timestamp has already passed, quota is stale -> Fail safe
+            if hours_to_reset <= 0:
                 return False
+
+            # Planned makespan must not cross the deadline
+            if hypothetical_makespan > hours_to_reset:
+                return False
+
+            return True
         except Exception:
-            pass
-        return True
+            # Malformed timestamp with deadline enforcement requested -> Fail safe
+            return False
 
     def _pack_balance_waterfill(
         self,
@@ -230,16 +327,19 @@ class AccelPackScheduler:
         unassigned_jobs: List[Job] = []
 
         for job in sorted_jobs:
-            candidate_choices: List[Tuple[int, float, float, InstancePlan, DeviceSlot]] = []
+            candidate_choices: List[Tuple[Any, ...]] = []
 
             for ip in instance_plans:
                 inst = ip.instance
                 session_limit = self.max_session_h if self.max_session_h is not None else inst.max_session_h
 
-                if not self._check_hardware_fit(ip, None, job):
+                # 1. Standalone feasibility check (Hardware class, standalone VRAM/RAM)
+                # Does NOT reject jobs that fit sequentially in existing slots!
+                if not self._check_standalone_fit(inst, job):
                     continue
 
                 for slot in ip.slots:
+                    # 2. Per-slot actual aggregate placement feasibility check
                     if not self._check_hardware_fit(ip, slot, job):
                         continue
 
@@ -255,11 +355,11 @@ class AccelPackScheduler:
                     if max(hyp_dev_loads.values(), default=0.0) > session_limit:
                         continue
 
-                    # Check reset deadline if applicable
+                    # Check reset deadline safely
                     if not self._check_reset_deadline(inst, hyp_makespan):
                         continue
 
-                    # Check account-level shared quota buffer
+                    # Check account-level shared quota buffer against authoritative pool
                     acc_id = self._get_account_id(inst)
                     other_inst_billed = sum(
                         other_ip.billed_resource_h
@@ -272,31 +372,54 @@ class AccelPackScheduler:
                     if post_quota_rem < self.quota_buffer_h:
                         continue
 
-                    # In BALANCE mode:
-                    # Priority 1: Fill an idle partner device or empty concurrent slot on an already-active instance
-                    currently_active = ip.is_active
-                    is_filling_idle = currently_active and slot.load_h == 0 and any(s.load_h > 0 for s in ip.slots)
-                    partner_rank = 0 if is_filling_idle else 1
+                    # Scoring based on ObjectiveMode
+                    if self.objective == ObjectiveMode.MAXIMIZE_EFFICIENCY:
+                        # Prioritize packing into already-active instances & devices to maximize useful work per billed hour
+                        current_work = ip.total_work_h
+                        new_work = current_work + job.duration_h
+                        new_efficiency = (new_work / hyp_billed) if hyp_billed > 0 else 0.0
 
-                    # Priority 2: Direct work to instance/account with highest remaining quota after billing
-                    quota_bin = -round(post_quota_rem, 2)
+                        partner_rank = 0 if ip.is_active else 1
+                        is_active_device = any(s.load_h > 0 for s in ip.slots if s.device_index == slot.device_index)
+                        device_pref = 0 if is_active_device else 1
 
-                    # Priority 3: Minimize device load imbalance + CPU contention penalty
-                    dev_loads = list(hyp_dev_loads.values())
-                    hyp_imbalance = max(dev_loads) - min(dev_loads)
-                    score = hyp_imbalance + self.cpu_penalty_weight * cpu_penalty
+                        # Sort by: partner_rank (prefer active nodes), -new_efficiency, device_pref, cpu_penalty
+                        candidate_choices.append((
+                            partner_rank,
+                            -round(new_efficiency, 4),
+                            device_pref,
+                            round(cpu_penalty, 3),
+                            ip,
+                            slot,
+                        ))
+                    else:
+                        # COMPLETE_ALL & MAXIMIZE_WORK:
+                        # Priority 1: Fill an idle partner device or empty concurrent slot on an already-active instance
+                        currently_active = ip.is_active
+                        is_filling_idle = currently_active and slot.load_h == 0 and any(s.load_h > 0 for s in ip.slots)
+                        partner_rank = 0 if is_filling_idle else 1
 
-                    candidate_choices.append((partner_rank, quota_bin, score, ip, slot))
+                        # Priority 2: Direct work to instance/account with highest remaining quota after billing
+                        quota_bin = -round(post_quota_rem, 2)
+
+                        # Priority 3: Normalized device imbalance + dimensionless CPU contention penalty
+                        dev_loads = list(hyp_dev_loads.values())
+                        hyp_imbalance = max(dev_loads) - min(dev_loads)
+                        max_l = max(dev_loads) if dev_loads else 1.0
+                        norm_imbalance = hyp_imbalance / max(1.0, max_l)
+                        score = norm_imbalance + self.cpu_penalty_weight * cpu_penalty
+
+                        candidate_choices.append((partner_rank, quota_bin, round(score, 4), ip, slot))
 
             if candidate_choices:
-                candidate_choices.sort(key=lambda item: (item[0], item[1], item[2]))
-                _, _, _, chosen_ip, chosen_slot = candidate_choices[0]
+                candidate_choices.sort(key=lambda item: item[:-2])
+                *_, chosen_ip, chosen_slot = candidate_choices[0]
                 chosen_slot.assign(job)
             else:
                 if not allow_partial:
                     return None
                 job.metadata["unassigned_reason"] = (
-                    "Exceeds session max, reset window, or quota safety buffer across all candidate instances"
+                    "Exceeds session max, reset window, hardware compatibility, or quota safety buffer"
                 )
                 unassigned_jobs.append(job)
 
@@ -318,6 +441,9 @@ class AccelPackScheduler:
             for ip in active_plans:
                 inst = ip.instance
                 session_limit = self.max_session_h if self.max_session_h is not None else inst.max_session_h
+
+                if not self._check_standalone_fit(inst, job):
+                    continue
 
                 for slot in ip.slots:
                     if not self._check_hardware_fit(ip, slot, job):
@@ -370,49 +496,46 @@ class AccelPackScheduler:
 
         return ExecutionPlan(instance_plans=all_plans, unassigned_jobs=unassigned_jobs)
 
-    def _check_hardware_fit(self, ip: InstancePlan, candidate_slot: Optional[DeviceSlot], job: Job) -> bool:
+    def _check_hardware_fit(self, ip: InstancePlan, candidate_slot: DeviceSlot, job: Job) -> bool:
         """
-        Verifies hardware feasibility:
-        1. VRAM: Per-device peak VRAM + safety margin <= physical accelerator capacity (HARD constraint).
-        2. Host RAM: Sum of peak RAM across all active slots + safety margin <= host RAM (HARD constraint).
-        3. Host CPU: Sum of peak CPU demand across active slots. CPU oversubscription is allowed as a soft
-           preference, but blocked if an explicit emergency cap (max_cpu_oversubscription_ratio) is configured.
+        Verifies actual hardware feasibility for placing job into candidate_slot:
+        1. Hardware class: Must match instance hardware_class if job specifies one.
+        2. VRAM: Per-device peak VRAM across concurrent slots on candidate device + safety margin <= capacity.
+        3. Host RAM: Sum of peak RAM across slots (accounting for sequential execution within candidate slot).
+        4. Host CPU: Sum of peak CPU demand across active slots, with optional emergency ratio check.
         """
         inst = ip.instance
 
-        # 1. Device-specific VRAM constraint
-        if candidate_slot is not None:
-            current_dev_vram = 0.0
-            for s in ip.slots:
-                if s.device_index == candidate_slot.device_index:
-                    slot_vram = s.peak_vram_gb if s is not candidate_slot else max(s.peak_vram_gb, job.vram_gb)
-                    current_dev_vram += slot_vram
-
-            if (current_dev_vram + self.safety_vram_margin_gb) > inst.vram_per_device_gb:
-                return False
-        else:
-            if (job.vram_gb + self.safety_vram_margin_gb) > inst.vram_per_device_gb:
+        # 1. Hardware class compatibility
+        if job.hardware_class is not None:
+            if job.hardware_class.strip().lower() != inst.hardware_class.strip().lower():
                 return False
 
-        # 2. Host-level RAM constraint
+        # 2. Device-specific VRAM constraint
+        current_dev_vram = 0.0
+        for s in ip.slots:
+            if s.device_index == candidate_slot.device_index:
+                slot_vram = max(s.peak_vram_gb, job.vram_gb) if s is candidate_slot else s.peak_vram_gb
+                current_dev_vram += slot_vram
+
+        if (current_dev_vram + self.safety_vram_margin_gb) > inst.vram_per_device_gb:
+            return False
+
+        # 3. Host-level RAM constraint (Within candidate_slot, jobs run sequentially: max(peak, job))
         current_host_ram = 0.0
         for s in ip.slots:
-            slot_ram = s.peak_ram_gb if s is not candidate_slot else max(s.peak_ram_gb, job.ram_gb)
+            slot_ram = max(s.peak_ram_gb, job.ram_gb) if s is candidate_slot else s.peak_ram_gb
             current_host_ram += slot_ram
-        if candidate_slot is None:
-            current_host_ram += job.ram_gb
 
         if (current_host_ram + self.safety_ram_margin_gb) > inst.host_ram_gb:
             return False
 
-        # 3. Host-level CPU constraint (Soft preference with optional hard ceiling)
+        # 4. Host-level CPU constraint
         current_host_cpu = 0.0
         for s in ip.slots:
-            slot_cpu = s.peak_cpu_cores if s is not candidate_slot else max(s.peak_cpu_cores, job.cpu_cores)
+            slot_cpu = max(s.peak_cpu_cores, job.cpu_cores) if s is candidate_slot else s.peak_cpu_cores
             if len(s.jobs) > 0 or (s is candidate_slot):
                 current_host_cpu += slot_cpu
-        if candidate_slot is None:
-            current_host_cpu += job.cpu_cores
 
         emergency_ratio = inst.max_cpu_oversubscription_ratio or self.max_cpu_oversubscription_ratio
         if emergency_ratio is not None and emergency_ratio > 0:

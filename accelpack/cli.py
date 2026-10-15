@@ -7,8 +7,10 @@ import json
 import sys
 from pathlib import Path
 
+from accelpack.estimator import ProfileDurationEstimator
 from accelpack.models import Instance, Job, ObjectiveMode, PackingStrategy
 from accelpack.preflight import PreflightValidator
+from accelpack.reconciliation import ExecutionReconciler
 from accelpack.scheduler import AccelPackScheduler, QuotaExceededException
 
 
@@ -35,12 +37,94 @@ def main():
         help="Emergency hard ceiling ratio for CPU oversubscription (e.g. 2.0)",
     )
     parser.add_argument("--enforce-reset-deadline", action="store_true", help="Reject assignments exceeding reset_at deadline")
+    parser.add_argument(
+        "--reject-conflicting-quotas",
+        action="store_true",
+        help="Reject scheduling if instances sharing an account declare conflicting quotas",
+    )
+    parser.add_argument("--no-expand-segments", action="store_true", help="Disable automatic expansion of segmented jobs")
     parser.add_argument("--allow-partial", action="store_true", help="Allow partial scheduling without error")
     parser.add_argument("--skip-preflight", action="store_true", help="Skip preflight validation")
     parser.add_argument("--ignore-blockers", action="store_true", help="Proceed with scheduling even if preflight has blockers")
     parser.add_argument("--output", type=str, default=None, help="Path to export schedule JSON")
+
+    # Telemetry and profiles integration
+    parser.add_argument("--history", type=str, default=None, help="Path to execution history JSON for online calibration")
+    parser.add_argument("--profiles", type=str, default=None, help="Path to throughput profiles database JSON")
+    parser.add_argument("--reestimate", action="store_true", help="Recalculate job durations using loaded profiles database")
+    parser.add_argument("--record-job", type=str, default=None, help="Path to completed job run summary JSON to record into history")
+    parser.add_argument("--accuracy-report", action="store_true", help="Print prediction accuracy and error report from history")
     args = parser.parse_args()
 
+    # 1. Telemetry & Profiling Initialization
+    reconciler = ExecutionReconciler(history_file=args.history) if args.history else None
+    estimator = ProfileDurationEstimator(default_fps=100.0)
+
+    if args.profiles and Path(args.profiles).exists():
+        try:
+            prof_data = json.loads(Path(args.profiles).read_text(encoding="utf-8"))
+            for p in prof_data:
+                estimator.register_profile(
+                    env_id=p["env_id"],
+                    model=p["model"],
+                    fps=p["fps"],
+                    vram_gb=p.get("vram_gb", 0.5),
+                    ram_gb=p.get("ram_gb", 1.5),
+                    cpu_cores=p.get("cpu_cores", 1.0),
+                    hardware_class=p.get("hardware_class", "nvidia_t4"),
+                    workers_per_device=p.get("workers_per_device", 1),
+                    samples=p.get("samples", 1),
+                    confidence=p.get("confidence", 1.0),
+                )
+        except Exception as e:
+            sys.stderr.write(f"[WARN AccelPack] Could not load profiles database {args.profiles}: {e}\n")
+
+    # Record completed job if requested
+    if args.record_job and Path(args.record_job).exists() and reconciler:
+        try:
+            run_data = json.loads(Path(args.record_job).read_text(encoding="utf-8"))
+            reconciler.record_job(
+                job_id=run_data["job_id"],
+                env_id=run_data.get("env_id", ""),
+                model=run_data.get("model", ""),
+                steps=run_data.get("steps", 0),
+                predicted_duration_h=run_data.get("predicted_duration_h", 0.0),
+                actual_duration_h=run_data.get("actual_duration_h", 0.0),
+                success=run_data.get("success", True),
+                instance_id=run_data.get("instance_id", ""),
+                device_index=run_data.get("device_index", 0),
+                concurrent_workers_on_device=run_data.get("concurrent_workers", 1),
+                hardware_class=run_data.get("hardware_class", "nvidia_t4"),
+                peak_vram_gb=run_data.get("peak_vram_gb"),
+                peak_ram_gb=run_data.get("peak_ram_gb"),
+                cpu_busy_pct=run_data.get("cpu_busy_pct"),
+                estimator=estimator,
+            )
+            print(f"[OK] Recorded completed job {run_data['job_id']} into history and calibrated profiles.")
+        except Exception as e:
+            sys.stderr.write(f"[ERROR AccelPack] Failed to record job summary: {e}\n")
+
+    # Print accuracy report if requested
+    if args.accuracy_report:
+        if reconciler:
+            acc_rep = reconciler.get_prediction_error_report()
+            print("\n" + "=" * 70)
+            print("ACCELPACK PREDICTION ACCURACY REPORT")
+            print(f"Total Records: {acc_rep['total_records']}")
+            print(f"Overall MAE: {acc_rep['overall']['mae_hours']:.4f}h | "
+                  f"RMSE: {acc_rep['overall']['rmse_hours']:.4f}h | "
+                  f"MAPE: {acc_rep['overall']['mape_pct']:.1f}% | "
+                  f"Success Rate: {acc_rep['overall']['success_rate'] * 100:.1f}%")
+            if acc_rep["by_stratum"]:
+                print("-" * 70)
+                print("Breakdown by Task / Hardware / Concurrency:")
+                for k, v in acc_rep["by_stratum"].items():
+                    print(f"  * {k}: count={v['count']}, MAE={v['mae_hours']:.4f}h, success={v['success_rate']*100:.0f}%")
+            print("=" * 70 + "\n")
+        else:
+            print("[WARN] --accuracy-report requires --history <file>.")
+
+    # 2. Parse instances and jobs
     instances_data = json.loads(Path(args.instances).read_text(encoding="utf-8"))
     instances = [
         Instance(
@@ -65,31 +149,47 @@ def main():
     ]
 
     jobs_data = json.loads(Path(args.jobs).read_text(encoding="utf-8"))
-    jobs = [
-        Job(
-            job_id=j["job_id"],
-            duration_h=j["duration_h"],
-            vram_gb=j.get("vram_gb", 0.5),
-            ram_gb=j.get("ram_gb", 1.5),
-            cpu_cores=j.get("cpu_cores", 1.0),
-            priority=j.get("priority", 1.0),
-            resumable=j.get("resumable", False),
-            segments=j.get("segments"),
-            hardware_class=j.get("hardware_class"),
-            metadata=j.get("metadata", {}),
-        )
-        for j in jobs_data
-    ]
+    jobs = []
+    for j in jobs_data:
+        duration_h = j["duration_h"]
+        # Re-estimate duration from loaded profiles if requested and steps provided
+        if args.reestimate and "metadata" in j and "steps" in j["metadata"]:
+            steps = j["metadata"]["steps"]
+            env_id = j["metadata"].get("env", "")
+            model = j["metadata"].get("model", "")
+            hw = j.get("hardware_class", "nvidia_t4")
+            duration_h = estimator.estimate_duration_h(steps, env_id=env_id, model=model, hardware_class=hw)
 
-    # Preflight Validation stage
+        jobs.append(
+            Job(
+                job_id=j["job_id"],
+                duration_h=duration_h,
+                vram_gb=j.get("vram_gb", 0.5),
+                ram_gb=j.get("ram_gb", 1.5),
+                cpu_cores=j.get("cpu_cores", 1.0),
+                priority=j.get("priority", 1.0),
+                resumable=j.get("resumable", False),
+                segments=j.get("segments"),
+                hardware_class=j.get("hardware_class"),
+                metadata=j.get("metadata", {}),
+            )
+        )
+
+    # 3. Preflight Validation stage
     if not args.skip_preflight:
-        validator = PreflightValidator(min_quota_buffer_h=args.quota_buffer)
+        validator = PreflightValidator(
+            min_quota_buffer_h=args.quota_buffer,
+            enforce_reset_deadline=args.enforce_reset_deadline,
+            strict_account_quotas=args.reject_conflicting_quotas,
+            allow_segmented_jobs=not args.no_expand_segments,
+        )
         report = validator.validate(jobs, instances)
         print(report.format_text())
         if not report.passed and not args.ignore_blockers:
-            print(f"[ERROR] Preflight validation failed with {len(report.blockers)} blocker(s). Aborting.")
+            print(f"[ERROR] Preflight validation failed with {len(report.blockers)} blocker(s). Use --ignore-blockers to override.")
             sys.exit(1)
 
+    # 4. Scheduling stage
     scheduler = AccelPackScheduler(
         strategy=PackingStrategy(args.strategy),
         objective=ObjectiveMode(args.objective),
@@ -100,6 +200,8 @@ def main():
         cpu_penalty_weight=args.cpu_penalty_weight,
         max_cpu_oversubscription_ratio=args.max_cpu_oversubscription,
         enforce_reset_deadline=args.enforce_reset_deadline,
+        reject_conflicting_account_quotas=args.reject_conflicting_quotas,
+        expand_segments=not args.no_expand_segments,
     )
 
     try:

@@ -45,10 +45,16 @@ class TestAccelPack(unittest.TestCase):
         self.assertFalse(rep.passed)
         self.assertTrue(any(i.code == "JOB_EXCEEDS_SESSION_LIMIT" for i in rep.blockers))
 
-        # 2. Resumable job passes
+        # 2. Resumable job passes preflight and is schedulable
         job_resumable = Job(job_id="huge_resumable", duration_h=12.0, resumable=True, segments=[6.0, 6.0])
         rep = validator.validate([job_resumable], [inst_good])
         self.assertTrue(rep.passed)
+        sched = AccelPackScheduler(expand_segments=True)
+        plan = sched.schedule([job_resumable], [inst_good])
+        self.assertEqual(len(plan.unassigned_jobs), 0)
+        scheduled_ids = [j.job_id for ip in plan.active_instances for s in ip.slots for j in s.jobs]
+        self.assertIn("huge_resumable_seg0", scheduled_ids)
+        self.assertIn("huge_resumable_seg1", scheduled_ids)
 
         # 3. Quota buffer warning
         job_normal = Job(job_id="norm", duration_h=1.0)
