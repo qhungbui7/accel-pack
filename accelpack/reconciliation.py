@@ -14,6 +14,13 @@ try:
 except ImportError:
     fcntl = None  # type: ignore
     HAS_FCNTL = False
+
+try:
+    import msvcrt
+    HAS_MSVCRT = True
+except ImportError:
+    msvcrt = None  # type: ignore
+    HAS_MSVCRT = False
 import hashlib
 import json
 import math
@@ -38,12 +45,22 @@ class HistoryLoadException(Exception):
     pass
 
 
+class ProfileLoadException(Exception):
+    """Raised when reading, parsing, or validating profile database from persistent storage fails."""
+    pass
+
+
+class LockAcquisitionException(Exception):
+    """Raised when an advisory cross-process lock cannot be acquired or locking is unsupported."""
+    pass
+
+
 @contextlib.contextmanager
 def file_lock(lock_target_path: Optional[Path | str]):
-    """Cross-process advisory lock using fcntl.flock on a sibling .lock file.
-    Provides robust exclusion on POSIX systems (Linux, macOS). On platforms where fcntl
-    is unavailable (e.g. native Windows) or when permissions prevent lock file creation,
-    provides a graceful fallback.
+    """Cross-process advisory lock using fcntl.flock (POSIX) or msvcrt.locking (Windows) on a sibling .lock file.
+    Provides robust exclusion across concurrent CLI processes.
+    Fails explicitly with LockAcquisitionException if lock file cannot be opened or locked,
+    or if no platform locking mechanism is available, closing any opened file descriptor.
     """
     if not lock_target_path:
         yield
@@ -52,33 +69,86 @@ def file_lock(lock_target_path: Optional[Path | str]):
     path = Path(lock_target_path)
     lock_path = path.with_name(f"{path.name}.lock")
     fd = None
+
     try:
         lock_path.parent.mkdir(parents=True, exist_ok=True)
-        if HAS_FCNTL and fcntl is not None:
+    except (PermissionError, OSError) as e:
+        raise LockAcquisitionException(f"Cannot create lock directory for {lock_path}: {e}") from e
+
+    if HAS_FCNTL and fcntl is not None:
+        try:
             fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR)
+        except (PermissionError, OSError) as e:
+            raise LockAcquisitionException(f"Cannot open lock file {lock_path}: {e}") from e
+
+        try:
             fcntl.flock(fd, fcntl.LOCK_EX)
-    except (PermissionError, OSError):
-        fd = None
+        except (PermissionError, OSError) as e:
+            try:
+                os.close(fd)
+            except Exception:
+                pass
+            fd = None
+            raise LockAcquisitionException(f"Failed to acquire advisory lock on {lock_path}: {e}") from e
+    elif HAS_MSVCRT and msvcrt is not None:
+        try:
+            fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR)
+        except (PermissionError, OSError) as e:
+            raise LockAcquisitionException(f"Cannot open lock file {lock_path}: {e}") from e
+
+        try:
+            msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
+        except (PermissionError, OSError) as e:
+            try:
+                os.close(fd)
+            except Exception:
+                pass
+            fd = None
+            raise LockAcquisitionException(f"Failed to acquire Windows file lock on {lock_path}: {e}") from e
+    else:
+        raise LockAcquisitionException(
+            f"Advisory locking is unavailable on platform '{sys.platform}' without fcntl or msvcrt. "
+            f"Cross-process concurrency protection cannot be guaranteed."
+        )
 
     try:
         yield
     finally:
         if fd is not None:
             try:
-                fcntl.flock(fd, fcntl.LOCK_UN)
+                if HAS_FCNTL and fcntl is not None:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                elif HAS_MSVCRT and msvcrt is not None:
+                    try:
+                        os.lseek(fd, 0, os.SEEK_SET)
+                        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+                    except Exception:
+                        pass
             finally:
                 os.close(fd)
 
 
 def atomic_save_json(target_path: Path | str, data: Any) -> None:
-    """Durably and atomically writes JSON data to target_path using a temporary file and atomic rename."""
+    """Durably and atomically writes JSON data to target_path using a temporary file,
+    fsync on file and parent directory, and atomic rename."""
     path = Path(target_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_name(f"{path.name}.tmp.{uuid.uuid4().hex[:8]}")
     payload = json.dumps(data, indent=2)
     try:
-        tmp_path.write_text(payload, encoding="utf-8")
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            f.write(payload)
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp_path, path)
+        try:
+            dir_fd = os.open(str(path.parent), os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except Exception:
+            pass
     finally:
         if tmp_path.exists():
             try:
@@ -213,23 +283,12 @@ class ExecutionReconciler:
 
     def _persist_history(self):
         if self.history_file:
-            tmp_file = None
             try:
                 self.history_file.parent.mkdir(parents=True, exist_ok=True)
                 data = [r.__dict__ for r in self.history[-500:]]  # Retain rolling 500 records
-                payload = json.dumps(data, indent=2)
-
-                # Atomic file replacement: write to unique temporary file in same directory, then atomic rename
-                tmp_file = self.history_file.with_name(f"{self.history_file.name}.tmp.{uuid.uuid4().hex[:8]}")
-                tmp_file.write_text(payload, encoding="utf-8")
-                os.replace(tmp_file, self.history_file)
+                atomic_save_json(self.history_file, data)
                 self.persist_error = None
             except Exception as e:
-                if tmp_file and tmp_file.exists():
-                    try:
-                        tmp_file.unlink()
-                    except Exception:
-                        pass
                 self.persist_error = f"Failed to write history file {self.history_file}: {e}"
                 sys.stderr.write(f"[ERROR AccelPack] {self.persist_error}\n")
                 raise HistoryPersistenceException(self.persist_error) from e
@@ -560,18 +619,31 @@ def reconcile_and_persist_profiles(
     """Full read-modify-write transactional coordinator for estimator profiles.
     Serializes profile reload, fresh history replay, and atomic persistence under a profile lock,
     guaranteeing that concurrent CLI processes cannot overwrite or lose telemetry updates.
+    Aborts cleanly with ProfileLoadException if an existing profile database cannot be parsed
+    or validated, leaving the original file byte-for-byte unchanged.
     """
     path = Path(profiles_path)
     with file_lock(path):
-        # 1. Reload latest persisted profiles from disk under profile lock
+        # 1. Reload latest persisted profiles from disk into a fresh temporary estimator
+        temp_estimator = ProfileDurationEstimator(default_fps=estimator.default_fps)
         if path.exists():
             try:
-                prof_data = json.loads(path.read_text(encoding="utf-8"))
-                for p in prof_data:
-                    estimator.register_profile(
+                content = path.read_text(encoding="utf-8")
+                prof_data = json.loads(content)
+                if not isinstance(prof_data, list):
+                    raise ValueError(f"Profiles database {path} must contain a JSON array, got {type(prof_data).__name__}")
+                for idx, p in enumerate(prof_data):
+                    if not isinstance(p, dict):
+                        raise ValueError(f"Profile record at index {idx} in {path} is not a valid JSON object")
+                    if "env_id" not in p or "model" not in p or "fps" not in p:
+                        raise ValueError(f"Profile record at index {idx} in {path} missing required fields ('env_id', 'model', 'fps')")
+                    fps_val = float(p["fps"])
+                    if fps_val <= 0:
+                        raise ValueError(f"Profile record at index {idx} in {path} has invalid fps {fps_val}")
+                    temp_estimator.register_profile(
                         env_id=p["env_id"],
                         model=p["model"],
-                        fps=p["fps"],
+                        fps=fps_val,
                         vram_gb=p.get("vram_gb", 0.5),
                         ram_gb=p.get("ram_gb", 1.5),
                         cpu_cores=p.get("cpu_cores", 1.0),
@@ -586,7 +658,12 @@ def reconcile_and_persist_profiles(
                         schema_version=p.get("schema_version"),
                     )
             except Exception as e:
-                sys.stderr.write(f"[WARN AccelPack] Could not reload latest profiles database {path}: {e}\n")
+                err_msg = f"Failed to load and validate profiles database {path}: {e}"
+                sys.stderr.write(f"[ERROR AccelPack] {err_msg}\n")
+                raise ProfileLoadException(err_msg) from e
+        else:
+            # If path does not exist yet on disk, inherit current in-memory estimator state as initial baseline
+            temp_estimator._profiles = dict(estimator._profiles)
 
         # 2. Obtain fresh snapshot of execution history under history lock (lock released immediately)
         with reconciler._file_lock():
@@ -594,11 +671,14 @@ def reconcile_and_persist_profiles(
             if reconciler.load_error is not None:
                 raise HistoryLoadException(reconciler.load_error)
 
-        # 3. Replay all unapplied historical executions into estimator in deterministic order
-        replay_res = reconciler.replay_into_estimator(estimator)
+        # 3. Replay all unapplied historical executions into temp_estimator in deterministic order
+        replay_res = reconciler.replay_into_estimator(temp_estimator)
 
         # 4. Atomically persist updated profiles
-        save_fn(path, estimator.to_dict_list())
+        save_fn(path, temp_estimator.to_dict_list())
+
+        # 5. Only upon successful persistence, replace active estimator's profile state
+        estimator._profiles = temp_estimator._profiles
 
         return replay_res
 

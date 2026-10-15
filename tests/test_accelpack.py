@@ -2296,6 +2296,193 @@ def test_account_declared_quota_consistent_and_order_independent():
     assert "Remaining After 0.00h / 5.00h" in sum_exceeded
 
 
+def test_malformed_profile_file_aborts_and_preserves_bytes(tmp_path):
+    """Verify that if an existing profiles database contains invalid records or malformed JSON,
+    reconcile_and_persist_profiles aborts with ProfileLoadException without overwriting,
+    leaving the original file byte-for-byte intact."""
+    from accelpack.reconciliation import (
+        ExecutionReconciler,
+        ProfileLoadException,
+        reconcile_and_persist_profiles,
+    )
+    from accelpack.estimator import ProfileDurationEstimator
+
+    profiles_file = tmp_path / "corrupt_profiles.json"
+    history_file = tmp_path / "history.json"
+
+    # Case 1: Structurally invalid profile record placed after valid profiles
+    valid_record_1 = {
+        "env_id": "cifar",
+        "model": "resnet",
+        "fps": 120.0,
+        "samples": 5,
+        "confidence": 0.85,
+    }
+    valid_record_2 = {
+        "env_id": "cartpole",
+        "model": "dqn",
+        "fps": 500.0,
+        "samples": 3,
+        "confidence": 0.90,
+    }
+    invalid_record = {
+        "env_id": "halfcheetah",
+        # Missing model and fps!
+        "garbage": True,
+    }
+    raw_payload_1 = json.dumps([valid_record_1, valid_record_2, invalid_record], indent=2).encode("utf-8")
+    profiles_file.write_bytes(raw_payload_1)
+
+    reconciler = ExecutionReconciler(history_file=history_file)
+    reconciler.record_job(
+        job_id="j1",
+        env_id="cifar",
+        model="resnet",
+        steps=100000,
+        predicted_duration_h=1.0,
+        actual_duration_h=0.5,
+        success=True,
+        instance_id="n1",
+        run_id="run_test_preserve",
+    )
+
+    estimator = ProfileDurationEstimator()
+    with pytest.raises(ProfileLoadException) as excinfo:
+        reconcile_and_persist_profiles(profiles_file, reconciler, estimator)
+    assert "Failed to load and validate profiles database" in str(excinfo.value)
+    # File must be byte-for-byte unchanged
+    assert profiles_file.read_bytes() == raw_payload_1
+
+    # Case 2: Malformed raw JSON syntax
+    raw_syntax_error = b"[\n  {\"env_id\": \"cifar\", \"model\": \"resnet\"},\n  {broken_json...\n"
+    profiles_file.write_bytes(raw_syntax_error)
+
+    with pytest.raises(ProfileLoadException):
+        reconcile_and_persist_profiles(profiles_file, reconciler, estimator)
+    # File must be byte-for-byte unchanged
+    assert profiles_file.read_bytes() == raw_syntax_error
+
+
+def test_profile_reload_does_not_resurrect_deleted_profiles(tmp_path):
+    """Verify that when a profile is removed from disk after initial estimator loading,
+    the transaction reloads from disk into a fresh estimator and does NOT resurrect
+    the deleted profile into the persistent file or active estimator."""
+    from accelpack.reconciliation import (
+        ExecutionReconciler,
+        atomic_save_json,
+        reconcile_and_persist_profiles,
+    )
+    from accelpack.estimator import ProfileDurationEstimator
+
+    profiles_file = tmp_path / "profiles.json"
+    history_file = tmp_path / "history.json"
+
+    # 1. Initial disk state has Profile A and Profile B
+    init_estimator = ProfileDurationEstimator()
+    init_estimator.register_profile(env_id="cifar", model="resnet", fps=100.0)
+    init_estimator.register_profile(env_id="cartpole", model="mlp", fps=400.0)
+    atomic_save_json(profiles_file, init_estimator.to_dict_list())
+
+    # 2. In-memory estimator starts with both profiles loaded
+    active_estimator = ProfileDurationEstimator()
+    for p in json.loads(profiles_file.read_text(encoding="utf-8")):
+        active_estimator.register_profile(env_id=p["env_id"], model=p["model"], fps=p["fps"])
+    assert active_estimator.get_profile(env_id="cartpole", model="mlp") is not None
+
+    # 3. An administrator deletes Profile B from the disk file
+    trimmed_profiles = [p for p in json.loads(profiles_file.read_text(encoding="utf-8")) if p["env_id"] != "cartpole"]
+    atomic_save_json(profiles_file, trimmed_profiles)
+
+    # 4. A job execution for Profile A finishes and reconciliation runs
+    reconciler = ExecutionReconciler(history_file=history_file)
+    reconciler.record_job(
+        job_id="j_a",
+        env_id="cifar",
+        model="resnet",
+        steps=360000,
+        predicted_duration_h=1.0,
+        actual_duration_h=0.5,
+        success=True,
+        instance_id="n1",
+        run_id="run_a_only",
+    )
+
+    reconcile_and_persist_profiles(profiles_file, reconciler, active_estimator)
+
+    # 5. Profile B MUST NOT be resurrected on disk
+    persisted = json.loads(profiles_file.read_text(encoding="utf-8"))
+    persisted_envs = [p["env_id"] for p in persisted]
+    assert "cartpole" not in persisted_envs
+    assert "cifar" in persisted_envs
+
+    # 6. Profile B MUST NOT remain in active_estimator._profiles
+    assert active_estimator.get_profile(env_id="cartpole", model="mlp") is None
+    assert active_estimator.get_profile(env_id="cifar", model="resnet") is not None
+
+
+def test_file_lock_acquisition_failure_explicit_and_no_descriptor_leak(tmp_path, monkeypatch):
+    """Verify that file_lock fails explicitly with LockAcquisitionException on lock failure
+    or unavailable locking, and guarantees that any opened file descriptor is closed without leakage."""
+    import errno
+    import os
+    from accelpack.reconciliation import (
+        LockAcquisitionException,
+        file_lock,
+    )
+    import accelpack.reconciliation as recon_mod
+
+    # Part A: Unwriteable directory fails explicitly
+    ro_dir = tmp_path / "locked_ro"
+    ro_dir.mkdir()
+    target_in_ro = ro_dir / "target.json"
+    ro_dir.chmod(0o555)
+
+    with pytest.raises(LockAcquisitionException):
+        with file_lock(target_in_ro):
+            pass
+
+    # Part B: Simulated flock failure closes descriptor and raises LockAcquisitionException
+    target_file = tmp_path / "flock_fail_target.json"
+    target_file.touch()
+
+    # Track open file descriptors before
+    def _count_open_fds():
+        count = 0
+        for fd in range(3, 256):
+            try:
+                os.fstat(fd)
+                count += 1
+            except OSError:
+                pass
+        return count
+
+    fds_before = _count_open_fds()
+
+    def _mock_flock(fd, op):
+        raise OSError(errno.EBADF, "Simulated flock failure")
+
+    monkeypatch.setattr("fcntl.flock", _mock_flock)
+
+    with pytest.raises(LockAcquisitionException) as excinfo:
+        with file_lock(target_file):
+            pass
+    assert "Failed to acquire advisory lock" in str(excinfo.value)
+
+    fds_after = _count_open_fds()
+    assert fds_after == fds_before, f"File descriptor leak detected! Before: {fds_before}, After: {fds_after}"
+
+    # Part C: Locking mechanism completely unavailable on platform
+    monkeypatch.undo()
+    monkeypatch.setattr(recon_mod, "HAS_FCNTL", False)
+    monkeypatch.setattr(recon_mod, "HAS_MSVCRT", False)
+
+    with pytest.raises(LockAcquisitionException) as excinfo_unavail:
+        with file_lock(target_file):
+            pass
+    assert "Advisory locking is unavailable" in str(excinfo_unavail.value)
+
+
+
 
 
 

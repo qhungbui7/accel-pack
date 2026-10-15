@@ -17,6 +17,8 @@ from accelpack.reconciliation import (
     ExecutionReconciler,
     HistoryLoadException,
     HistoryPersistenceException,
+    LockAcquisitionException,
+    ProfileLoadException,
     ReplayResult,
     atomic_save_json,
     file_lock,
@@ -28,31 +30,37 @@ from accelpack.scheduler import AccelPackScheduler, QuotaExceededException
 def load_or_assign_execution_record(record_path: Path | str) -> Dict[str, Any]:
     """Loads a job record JSON, ensuring a stable, canonical run_id exists under file lock.
     If run_id is missing, generates one, persists it atomically, and returns the canonical dict.
-    Fails closed if the record cannot be read or if a generated run_id cannot be persisted.
+    Fails closed if the record cannot be read, if lock acquisition fails, or if a generated run_id cannot be persisted.
     """
     path = Path(record_path)
-    with file_lock(path):
-        try:
-            content = path.read_text(encoding="utf-8")
-            data = json.loads(content)
-        except Exception as e:
-            raise RuntimeError(f"Failed to read job record file {path}: {e}") from e
+    try:
+        with file_lock(path):
+            try:
+                content = path.read_text(encoding="utf-8")
+                data = json.loads(content)
+            except Exception as e:
+                raise RuntimeError(f"Failed to read job record file {path}: {e}") from e
 
-        if data.get("run_id"):
+            if data.get("run_id"):
+                return data
+
+            jid = data.get("job_id", "job")
+            assigned_run_id = f"run_{jid}_{uuid.uuid4().hex[:12]}"
+            data["run_id"] = assigned_run_id
+            try:
+                atomic_save_json(path, data)
+            except Exception as e:
+                raise RuntimeError(
+                    f"Cannot persist generated run_id to {path}: {e}. "
+                    f"Aborting execution recording to prevent breaking idempotence."
+                ) from e
+
             return data
-
-        jid = data.get("job_id", "job")
-        assigned_run_id = f"run_{jid}_{uuid.uuid4().hex[:12]}"
-        data["run_id"] = assigned_run_id
-        try:
-            atomic_save_json(path, data)
-        except Exception as e:
-            raise RuntimeError(
-                f"Cannot persist generated run_id to {path}: {e}. "
-                f"Aborting execution recording to prevent breaking idempotence."
-            ) from e
-
-        return data
+    except LockAcquisitionException as e:
+        raise RuntimeError(
+            f"Cannot persist generated run_id to {path}: failed to acquire lock ({e}). "
+            f"Aborting execution recording to prevent breaking idempotence."
+        ) from e
 
 
 def main():
@@ -138,6 +146,12 @@ def main():
         except HistoryLoadException as e:
             sys.stderr.write(f"[ERROR AccelPack] Failed to load history file: {e}\n")
             return
+        except ProfileLoadException as e:
+            sys.stderr.write(f"[ERROR AccelPack] Failed to load profiles database: {e}\n")
+            return
+        except LockAcquisitionException as e:
+            sys.stderr.write(f"[ERROR AccelPack] Lock acquisition failed: {e}\n")
+            return
         except Exception as e:
             sys.stderr.write(f"[ERROR AccelPack] Failed to replay history into profiles: {e}\n")
 
@@ -182,6 +196,9 @@ def main():
         except HistoryPersistenceException as e:
             sys.stderr.write(f"[ERROR AccelPack] Failed to persist job execution history: {e}\n")
             return
+        except LockAcquisitionException as e:
+            sys.stderr.write(f"[ERROR AccelPack] Failed to acquire lock to record job: {e}\n")
+            return
         except Exception as e:
             sys.stderr.write(f"[ERROR AccelPack] Failed to record job summary: {e}\n")
             return
@@ -191,6 +208,16 @@ def main():
             try:
                 reconcile_and_persist_profiles(args.profiles, reconciler, estimator, save_fn=atomic_save_json)
                 print(f"[OK] Persisted {len(estimator.to_dict_list())} updated profiles to {args.profiles}")
+            except ProfileLoadException as e:
+                sys.stderr.write(
+                    f"[ERROR AccelPack] History record was saved, but existing profiles database could not be loaded: {e}. "
+                    f"Original profile file was preserved without changes.\n"
+                )
+            except LockAcquisitionException as e:
+                sys.stderr.write(
+                    f"[ERROR AccelPack] History record was saved, but lock acquisition failed for {args.profiles}: {e}. "
+                    f"Subsequent replay will recover profile calibrations from history.\n"
+                )
             except Exception as e:
                 sys.stderr.write(
                     f"[ERROR AccelPack] History record was saved, but failed to persist updated profiles to {args.profiles}: {e}. "
