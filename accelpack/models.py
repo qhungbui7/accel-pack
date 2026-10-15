@@ -40,15 +40,20 @@ class Job:
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self):
-        if self.duration_h <= 0:
-            raise ValueError(f"Job duration must be > 0, got {self.duration_h}")
+        if not isinstance(self.duration_h, (int, float)) or not math.isfinite(self.duration_h) or self.duration_h <= 0:
+            raise ValueError(f"Job duration must be a finite positive number, got {self.duration_h}")
+        for name, val in [("vram_gb", self.vram_gb), ("ram_gb", self.ram_gb), ("cpu_cores", self.cpu_cores)]:
+            if not isinstance(val, (int, float)) or not math.isfinite(val) or val < 0:
+                raise ValueError(f"{name} must be a finite non-negative number, got {val}")
+        if not isinstance(self.priority, (int, float)) or not math.isfinite(self.priority) or self.priority <= 0:
+            raise ValueError(f"Job priority must be a finite positive number, got {self.priority}")
         if self.device_count != 1:
             raise NotImplementedError("Multi-accelerator single-job gang scheduling is not yet supported.")
         if self.segments is not None:
             if not self.segments:
                 raise ValueError("Job segments list cannot be empty if specified.")
-            if any(s <= 0 for s in self.segments):
-                raise ValueError(f"All segments must be > 0 hours, got {self.segments}")
+            if any(not isinstance(s, (int, float)) or not math.isfinite(s) or s <= 0 for s in self.segments):
+                raise ValueError(f"All segments must be finite numbers > 0 hours, got {self.segments}")
             seg_sum = sum(self.segments)
             if not math.isclose(seg_sum, self.duration_h, rel_tol=1e-2, abs_tol=1e-2):
                 raise ValueError(
@@ -100,6 +105,16 @@ class Instance:
     def __post_init__(self):
         if not self.account_id:
             self.account_id = self.instance_id
+        for name, val in [
+            ("remaining_quota_h", self.remaining_quota_h),
+            ("max_session_h", self.max_session_h),
+            ("vram_per_device_gb", self.vram_per_device_gb),
+            ("host_ram_gb", self.host_ram_gb),
+            ("host_cpu_cores", self.host_cpu_cores),
+            ("debit_rate", self.debit_rate),
+        ]:
+            if not isinstance(val, (int, float)) or not math.isfinite(val):
+                raise ValueError(f"{name} must be a finite number, got {val}")
         if self.device_count <= 0:
             raise ValueError(f"device_count must be > 0, got {self.device_count}")
         if self.max_session_h <= 0:

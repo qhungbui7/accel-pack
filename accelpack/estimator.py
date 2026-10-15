@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import math
 from typing import Any, Dict, List, Optional, Tuple
 from accelpack.models import Job
 
@@ -33,6 +34,19 @@ class ProfileRecord:
     legacy_job_ids: List[str] = field(default_factory=list)
     migrated_legacy_job_ids: List[str] = field(default_factory=list)
 
+    def __post_init__(self):
+        if not isinstance(self.throughput, (int, float)) or not math.isfinite(self.throughput) or self.throughput <= 0:
+            raise ValueError(f"throughput must be a finite positive number, got {self.throughput}")
+        for name, val in [("vram_gb", self.vram_gb), ("ram_gb", self.ram_gb), ("cpu_cores", self.cpu_cores)]:
+            if not isinstance(val, (int, float)) or not math.isfinite(val) or val < 0:
+                raise ValueError(f"{name} must be a finite non-negative number, got {val}")
+        if not isinstance(self.confidence, (int, float)) or not math.isfinite(self.confidence) or not (0.0 <= self.confidence <= 1.0):
+            raise ValueError(f"confidence must be a finite number between 0.0 and 1.0, got {self.confidence}")
+        if not isinstance(self.samples, int) or isinstance(self.samples, bool) or self.samples < 0:
+            raise ValueError(f"samples must be a non-negative integer, got {self.samples}")
+        if not isinstance(self.workers_per_device, int) or isinstance(self.workers_per_device, bool) or self.workers_per_device < 1:
+            raise ValueError(f"workers_per_device must be an integer >= 1, got {self.workers_per_device}")
+
     @property
     def applied_job_ids(self) -> List[str]:
         """Backward-compatible alias for applied_run_ids and legacy job markers."""
@@ -45,7 +59,9 @@ class ProfileDurationEstimator:
     """
 
     def __init__(self, default_fps: float = 100.0):
-        self.default_fps = default_fps
+        if not isinstance(default_fps, (int, float)) or not math.isfinite(default_fps) or default_fps <= 0:
+            raise ValueError(f"default_fps must be a finite positive number, got {default_fps}")
+        self.default_fps = float(default_fps)
         # Key: (env_id, model_architecture, hardware_class, workers_per_device) -> ProfileRecord
         self._profiles: Dict[Tuple[str, str, str, int], ProfileRecord] = {}
 
@@ -86,8 +102,18 @@ class ProfileDurationEstimator:
         without string-pattern heuristics. Legacy job markers from applied_job_ids or legacy_job_ids
         are tracked separately for one-time historical migration.
         """
-        if fps <= 0:
-            raise ValueError(f"FPS must be positive, got {fps}")
+        if not isinstance(fps, (int, float)) or not math.isfinite(fps) or fps <= 0:
+            raise ValueError(f"FPS must be a finite positive number, got {fps}")
+        for name, val in [("vram_gb", vram_gb), ("ram_gb", ram_gb), ("cpu_cores", cpu_cores)]:
+            if not isinstance(val, (int, float)) or not math.isfinite(val) or val < 0:
+                raise ValueError(f"{name} must be a finite non-negative number, got {val}")
+        if not isinstance(confidence, (int, float)) or not math.isfinite(confidence) or not (0.0 <= confidence <= 1.0):
+            raise ValueError(f"confidence must be a finite number between 0.0 and 1.0, got {confidence}")
+        if not isinstance(samples, int) or isinstance(samples, bool) or samples < 0:
+            raise ValueError(f"samples must be a non-negative integer, got {samples}")
+        if not isinstance(workers_per_device, int) or isinstance(workers_per_device, bool) or workers_per_device < 1:
+            raise ValueError(f"workers_per_device must be an integer >= 1, got {workers_per_device}")
+
         key = self._normalize_key(env_id, model, hardware_class, workers_per_device)
 
         # 1. applied_run_ids is authoritative: every entry is an execution ID

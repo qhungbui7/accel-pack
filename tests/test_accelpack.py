@@ -1,10 +1,13 @@
 """Comprehensive regression and unit tests for AccelPack multi-accelerator scheduling engine."""
 
+import io
 import json
+import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import pytest
 
+from accelpack import cli
 from accelpack.estimator import ProfileDurationEstimator
 from accelpack.models import (
     DeviceSlot,
@@ -20,7 +23,9 @@ from accelpack.reconciliation import (
     ExecutionReconciler,
     HistoryLoadException,
     HistoryPersistenceException,
+    ProfileLoadException,
     atomic_save_json,
+    load_and_validate_profiles,
 )
 from accelpack.scheduler import AccelPackScheduler, QuotaExceededException
 
@@ -383,9 +388,8 @@ def test_cli_preflight_blocks_and_export(tmp_path, monkeypatch):
 
     monkeypatch.setattr("sys.argv", ["accelpack.cli", "--instances", str(inst_file), "--jobs", str(bad_jobs_file)])
 
-    with pytest.raises(SystemExit) as exc:
-        cli.main()
-    assert exc.value.code == 1
+    ret = cli.main()
+    assert ret == cli.EXIT_SCHEDULING_ERROR
 
     good_jobs_file = tmp_path / "good_jobs.json"
     good_jobs_file.write_text(json.dumps([{"job_id": "job_1", "duration_h": 1.0}]))
@@ -1614,7 +1618,8 @@ def test_failed_persistence_of_input_run_id_fail_closes(tmp_path, monkeypatch):
         err1 = io.StringIO()
         monkeypatch.setattr(sys, "stdout", out1)
         monkeypatch.setattr(sys, "stderr", err1)
-        cli.main()
+        ret1 = cli.main()
+        assert ret1 == cli.EXIT_PERSISTENCE_ERROR
 
         # Must fail closed with error on first invocation
         assert "Cannot persist generated run_id" in err1.getvalue()
@@ -1624,7 +1629,8 @@ def test_failed_persistence_of_input_run_id_fail_closes(tmp_path, monkeypatch):
         err2 = io.StringIO()
         monkeypatch.setattr(sys, "stdout", out2)
         monkeypatch.setattr(sys, "stderr", err2)
-        cli.main()
+        ret2 = cli.main()
+        assert ret2 == cli.EXIT_PERSISTENCE_ERROR
         assert "Cannot persist generated run_id" in err2.getvalue()
 
         # Verify that history is empty (never recorded without a durable run_id)
@@ -1825,7 +1831,8 @@ def test_cli_separate_history_and_profile_persistence_reporting(tmp_path, monkey
     err = io.StringIO()
     monkeypatch.setattr(sys, "stdout", out)
     monkeypatch.setattr(sys, "stderr", err)
-    cli.main()
+    ret = cli.main()
+    assert ret == cli.EXIT_PARTIAL_PERSISTENCE
 
     stdout_text = out.getvalue()
     stderr_text = err.getvalue()
@@ -2480,6 +2487,177 @@ def test_file_lock_acquisition_failure_explicit_and_no_descriptor_leak(tmp_path,
         with file_lock(target_file):
             pass
     assert "Advisory locking is unavailable" in str(excinfo_unavail.value)
+
+
+# ==============================================================================
+# REGRESSION TESTS: CLI FAIL-CLOSED VALIDATION, NON-FINITE REJECTION, EXIT CODES
+# ==============================================================================
+
+
+def test_corrupted_profiles_stops_cli_startup_without_partial_load(tmp_path, monkeypatch):
+    """Verify that a profile database with a valid entry followed by an invalid entry
+    fails closed immediately at startup with EXIT_INPUT_ERROR without leaving partial state in estimator."""
+    inst_file = tmp_path / "instances.json"
+    inst_file.write_text(json.dumps([{"instance_id": "i1", "device_count": 1, "remaining_quota_h": 10.0}]))
+    jobs_file = tmp_path / "jobs.json"
+    jobs_file.write_text(json.dumps([{"job_id": "j1", "duration_h": 2.0, "metadata": {"env": "env1", "model": "m1", "steps": 1000}}]))
+
+    # Valid entry followed by invalid entry (negative fps)
+    bad_profiles = [
+        {"env_id": "env1", "model": "m1", "fps": 100.0},
+        {"env_id": "env2", "model": "m2", "fps": -50.0},
+    ]
+    bad_prof_file = tmp_path / "bad_profiles.json"
+    bad_prof_file.write_text(json.dumps(bad_profiles))
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "accelpack.cli",
+            "--instances", str(inst_file),
+            "--jobs", str(jobs_file),
+            "--profiles", str(bad_prof_file),
+            "--reestimate",
+        ],
+    )
+
+    err = io.StringIO()
+    monkeypatch.setattr(sys, "stderr", err)
+    ret = cli.main()
+
+    assert ret == cli.EXIT_INPUT_ERROR
+    assert "Failed to load profiles database" in err.getvalue()
+
+
+def test_corrupted_history_with_zero_valid_records_stops_cli_startup(tmp_path, monkeypatch):
+    """Verify that a corrupted history file fails closed with EXIT_INPUT_ERROR even when 0 records are loaded."""
+    inst_file = tmp_path / "instances.json"
+    inst_file.write_text(json.dumps([{"instance_id": "i1", "device_count": 1, "remaining_quota_h": 10.0}]))
+    jobs_file = tmp_path / "jobs.json"
+    jobs_file.write_text(json.dumps([{"job_id": "j1", "duration_h": 2.0}]))
+
+    bad_history_file = tmp_path / "bad_history.json"
+    bad_history_file.write_text("NOT_VALID_JSON{{{")
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "accelpack.cli",
+            "--instances", str(inst_file),
+            "--jobs", str(jobs_file),
+            "--history", str(bad_history_file),
+        ],
+    )
+
+    err = io.StringIO()
+    monkeypatch.setattr(sys, "stderr", err)
+    ret = cli.main()
+
+    assert ret == cli.EXIT_INPUT_ERROR
+    assert "Failed to load history file" in err.getvalue()
+
+
+def test_non_finite_profile_values_rejected():
+    """Verify that NaN, +Infinity, and -Infinity are strictly rejected across all ProfileRecord fields."""
+    estimator = ProfileDurationEstimator(default_fps=100.0)
+
+    # 1. Non-finite FPS rejected
+    for invalid_fps in (float("nan"), float("inf"), float("-inf"), 0.0, -10.0):
+        with pytest.raises(ValueError, match="(?i)fps"):
+            estimator.register_profile(env_id="e", model="m", fps=invalid_fps)
+
+    # 2. Non-finite VRAM rejected
+    for invalid_vram in (float("nan"), float("inf"), float("-inf"), -0.1):
+        with pytest.raises(ValueError, match="(?i)vram"):
+            estimator.register_profile(env_id="e", model="m", fps=100.0, vram_gb=invalid_vram)
+
+    # 3. Non-finite RAM rejected
+    for invalid_ram in (float("nan"), float("inf"), float("-inf"), -0.1):
+        with pytest.raises(ValueError, match="(?i)ram"):
+            estimator.register_profile(env_id="e", model="m", fps=100.0, ram_gb=invalid_ram)
+
+    # 4. Non-finite CPU rejected
+    for invalid_cpu in (float("nan"), float("inf"), float("-inf"), -0.1):
+        with pytest.raises(ValueError, match="(?i)cpu"):
+            estimator.register_profile(env_id="e", model="m", fps=100.0, cpu_cores=invalid_cpu)
+
+    # 5. Non-finite or out-of-range confidence rejected
+    for invalid_conf in (float("nan"), float("inf"), float("-inf"), -0.1, 1.5):
+        with pytest.raises(ValueError, match="(?i)confidence"):
+            estimator.register_profile(env_id="e", model="m", fps=100.0, confidence=invalid_conf)
+
+    # 6. Invalid workers or samples
+    with pytest.raises(ValueError, match="(?i)workers"):
+        estimator.register_profile(env_id="e", model="m", fps=100.0, workers_per_device=0)
+    with pytest.raises(ValueError, match="(?i)samples"):
+        estimator.register_profile(env_id="e", model="m", fps=100.0, samples=-1)
+
+
+def test_atomic_save_json_and_loads_reject_nan(tmp_path):
+    """Verify that json parsing and serialization reject NaN and Infinity constants."""
+    target_file = tmp_path / "test_nan.json"
+
+    # atomic_save_json uses allow_nan=False
+    with pytest.raises(ValueError):
+        atomic_save_json(target_file, {"fps": float("nan")})
+
+    with pytest.raises(ValueError):
+        atomic_save_json(target_file, {"vram_gb": float("inf")})
+
+    # load_and_validate_profiles rejects JSON files containing NaN constants
+    nan_file = tmp_path / "raw_nan.json"
+    nan_file.write_text('[{"env_id": "e", "model": "m", "fps": NaN}]', encoding="utf-8")
+    with pytest.raises(ProfileLoadException):
+        load_and_validate_profiles(nan_file)
+
+    inf_file = tmp_path / "raw_inf.json"
+    inf_file.write_text('[{"env_id": "e", "model": "m", "fps": Infinity}]', encoding="utf-8")
+    with pytest.raises(ProfileLoadException):
+        load_and_validate_profiles(inf_file)
+
+
+def test_non_finite_job_and_instance_values_rejected():
+    """Verify that Job and Instance dataclasses validate finiteness of resource requirements."""
+    # Job duration, vram, ram, cpu
+    with pytest.raises(ValueError, match="(?i)duration"):
+        Job(job_id="j1", duration_h=float("nan"))
+    with pytest.raises(ValueError, match="(?i)vram"):
+        Job(job_id="j1", duration_h=1.0, vram_gb=float("inf"))
+    with pytest.raises(ValueError, match="(?i)ram"):
+        Job(job_id="j1", duration_h=1.0, ram_gb=float("-inf"))
+    with pytest.raises(ValueError, match="(?i)cpu"):
+        Job(job_id="j1", duration_h=1.0, cpu_cores=float("nan"))
+
+    # Instance quotas and capacities
+    with pytest.raises(ValueError, match="(?i)quota"):
+        Instance(instance_id="i1", remaining_quota_h=float("nan"))
+    with pytest.raises(ValueError, match="(?i)session"):
+        Instance(instance_id="i1", max_session_h=float("inf"))
+    with pytest.raises(ValueError, match="(?i)vram"):
+        Instance(instance_id="i1", vram_per_device_gb=float("-inf"))
+
+
+def test_cli_exit_codes_matrix(tmp_path, monkeypatch):
+    """Verify explicit exit codes across the CLI failure/success spectrum."""
+    inst_file = tmp_path / "instances.json"
+    inst_file.write_text(json.dumps([{"instance_id": "i1", "device_count": 1, "remaining_quota_h": 10.0}]))
+    jobs_file = tmp_path / "jobs.json"
+    jobs_file.write_text(json.dumps([{"job_id": "j1", "duration_h": 1.0}]))
+
+    # 1. Success -> EXIT_SUCCESS (0)
+    monkeypatch.setattr("sys.argv", ["accelpack.cli", "--instances", str(inst_file), "--jobs", str(jobs_file)])
+    assert cli.main() == cli.EXIT_SUCCESS
+
+    # 2. Input Error -> EXIT_INPUT_ERROR (1)
+    monkeypatch.setattr("sys.argv", ["accelpack.cli", "--instances", "/nonexistent.json", "--jobs", str(jobs_file)])
+    assert cli.main() == cli.EXIT_INPUT_ERROR
+
+    # 3. Scheduling Error -> EXIT_SCHEDULING_ERROR (2)
+    big_jobs = tmp_path / "big_jobs.json"
+    big_jobs.write_text(json.dumps([{"job_id": "j_huge", "duration_h": 50.0}]))
+    monkeypatch.setattr("sys.argv", ["accelpack.cli", "--instances", str(inst_file), "--jobs", str(big_jobs)])
+    assert cli.main() == cli.EXIT_SCHEDULING_ERROR
+
 
 
 

@@ -21,6 +21,7 @@ try:
 except ImportError:
     msvcrt = None  # type: ignore
     HAS_MSVCRT = False
+import errno
 import hashlib
 import json
 import math
@@ -33,6 +34,10 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from accelpack.estimator import ProfileDurationEstimator
+
+
+def _reject_non_standard_json_constants(c: str) -> None:
+    raise ValueError(f"Non-standard JSON constant '{c}' (NaN/Infinity) is not allowed")
 
 
 class HistoryPersistenceException(Exception):
@@ -130,11 +135,15 @@ def file_lock(lock_target_path: Optional[Path | str]):
 
 def atomic_save_json(target_path: Path | str, data: Any) -> None:
     """Durably and atomically writes JSON data to target_path using a temporary file,
-    fsync on file and parent directory, and atomic rename."""
+    fsync on file and parent directory, and atomic rename.
+    Directory synchronization is performed on platforms that support opening directory
+    file descriptors (POSIX); on unsupported platforms (e.g. Windows), only file-level
+    fsync is guaranteed.
+    """
     path = Path(target_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_name(f"{path.name}.tmp.{uuid.uuid4().hex[:8]}")
-    payload = json.dumps(data, indent=2)
+    payload = json.dumps(data, indent=2, allow_nan=False)
     try:
         with open(tmp_path, "w", encoding="utf-8") as f:
             f.write(payload)
@@ -147,8 +156,9 @@ def atomic_save_json(target_path: Path | str, data: Any) -> None:
                 os.fsync(dir_fd)
             finally:
                 os.close(dir_fd)
-        except Exception:
-            pass
+        except (OSError, PermissionError) as e:
+            if getattr(e, "errno", None) == getattr(errno, "EIO", 5):
+                raise
     finally:
         if tmp_path.exists():
             try:
@@ -225,7 +235,7 @@ class ExecutionReconciler:
         if self.history_file and self.history_file.exists():
             try:
                 content = self.history_file.read_text(encoding="utf-8")
-                data = json.loads(content)
+                data = json.loads(content, parse_constant=_reject_non_standard_json_constants)
                 if not isinstance(data, list):
                     raise ValueError(f"History file {self.history_file} must contain a JSON array, got {type(data).__name__}")
                 for idx, r in enumerate(data):
@@ -238,6 +248,11 @@ class ExecutionReconciler:
                         dur = r.get("actual_duration_h", 0.0)
                         content_sig = f"{jid}:{ts}:{steps}:{dur}:{idx}"
                         r["run_id"] = f"legacy_{jid}_{idx}_{hashlib.sha256(content_sig.encode('utf-8')).hexdigest()[:8]}"
+                    for num_field in ("predicted_duration_h", "actual_duration_h", "peak_vram_gb", "peak_ram_gb", "cpu_busy_pct", "measured_fps"):
+                        if num_field in r and r[num_field] is not None:
+                            val = float(r[num_field])
+                            if not math.isfinite(val):
+                                raise ValueError(f"Record at index {idx} in {self.history_file} has non-finite {num_field}: {r[num_field]}")
                     self.history.append(JobExecutionRecord(**r))
             except Exception as e:
                 self.load_error = f"Corrupted or invalid history file {self.history_file}: {e}"
@@ -254,7 +269,7 @@ class ExecutionReconciler:
         if self.history_file and self.history_file.exists():
             try:
                 content = self.history_file.read_text(encoding="utf-8")
-                data = json.loads(content)
+                data = json.loads(content, parse_constant=_reject_non_standard_json_constants)
                 if not isinstance(data, list):
                     raise ValueError(f"History file {self.history_file} must contain a JSON array, got {type(data).__name__}")
                 existing_by_run_id = {r.run_id: r for r in self.history}
@@ -271,6 +286,11 @@ class ExecutionReconciler:
                         content_sig = f"{jid}:{ts}:{steps}:{dur}:{idx}"
                         rid = f"legacy_{jid}_{idx}_{hashlib.sha256(content_sig.encode('utf-8')).hexdigest()[:8]}"
                         r["run_id"] = rid
+                    for num_field in ("predicted_duration_h", "actual_duration_h", "peak_vram_gb", "peak_ram_gb", "cpu_busy_pct", "measured_fps"):
+                        if num_field in r and r[num_field] is not None:
+                            val = float(r[num_field])
+                            if not math.isfinite(val):
+                                raise ValueError(f"Record at index {idx} in {self.history_file} has non-finite {num_field}: {r[num_field]}")
                     if rid in existing_by_run_id:
                         recs.append(existing_by_run_id[rid])
                     else:
@@ -610,6 +630,91 @@ class ExecutionReconciler:
         return ReplayResult(count, migrations_count)
 
 
+def load_and_validate_profiles(
+    profiles_path: Path | str,
+    estimator: Optional[ProfileDurationEstimator] = None,
+    default_fps: float = 100.0,
+) -> ProfileDurationEstimator:
+    """Strictly loads and validates all profile records from a JSON file into an estimator.
+    Fails closed by raising ProfileLoadException on missing file, corrupted JSON, non-array format,
+    missing required fields, non-finite values (NaN/Infinity), or out-of-bounds metrics.
+    If an existing estimator is provided, records are loaded into a temporary staging copy first;
+    the target estimator is modified only if all entries pass validation.
+    """
+    path = Path(profiles_path)
+    if not path.exists():
+        raise ProfileLoadException(f"Profiles database not found: {path}")
+
+    target = estimator if estimator is not None else ProfileDurationEstimator(default_fps=default_fps)
+    staging = ProfileDurationEstimator(default_fps=target.default_fps)
+
+    try:
+        content = path.read_text(encoding="utf-8")
+        prof_data = json.loads(content, parse_constant=_reject_non_standard_json_constants)
+        if not isinstance(prof_data, list):
+            raise ValueError(f"Profiles database {path} must contain a JSON array, got {type(prof_data).__name__}")
+        for idx, p in enumerate(prof_data):
+            if not isinstance(p, dict):
+                raise ValueError(f"Profile record at index {idx} in {path} is not a valid JSON object")
+            if "env_id" not in p or "model" not in p or "fps" not in p:
+                raise ValueError(f"Profile record at index {idx} in {path} missing required fields ('env_id', 'model', 'fps')")
+
+            try:
+                fps_val = float(p["fps"])
+            except (ValueError, TypeError) as e:
+                raise ValueError(f"Profile record at index {idx} in {path} has invalid fps: {p['fps']}") from e
+            if not math.isfinite(fps_val) or fps_val <= 0:
+                raise ValueError(f"Profile record at index {idx} in {path} has non-finite or non-positive fps: {fps_val}")
+
+            vram_val = float(p.get("vram_gb", 0.5))
+            if not math.isfinite(vram_val) or vram_val < 0:
+                raise ValueError(f"Profile record at index {idx} in {path} has invalid vram_gb: {vram_val}")
+
+            ram_val = float(p.get("ram_gb", 1.5))
+            if not math.isfinite(ram_val) or ram_val < 0:
+                raise ValueError(f"Profile record at index {idx} in {path} has invalid ram_gb: {ram_val}")
+
+            cpu_val = float(p.get("cpu_cores", 1.0))
+            if not math.isfinite(cpu_val) or cpu_val < 0:
+                raise ValueError(f"Profile record at index {idx} in {path} has invalid cpu_cores: {cpu_val}")
+
+            conf_val = float(p.get("confidence", 1.0))
+            if not math.isfinite(conf_val) or not (0.0 <= conf_val <= 1.0):
+                raise ValueError(f"Profile record at index {idx} in {path} has invalid confidence: {conf_val}")
+
+            samples_val = p.get("samples", 1)
+            if not isinstance(samples_val, int) or isinstance(samples_val, bool) or samples_val < 0:
+                raise ValueError(f"Profile record at index {idx} in {path} has invalid samples: {samples_val}")
+
+            workers_val = p.get("workers_per_device", 1)
+            if not isinstance(workers_val, int) or isinstance(workers_val, bool) or workers_val < 1:
+                raise ValueError(f"Profile record at index {idx} in {path} has invalid workers_per_device: {workers_val}")
+
+            staging.register_profile(
+                env_id=p["env_id"],
+                model=p["model"],
+                fps=fps_val,
+                vram_gb=vram_val,
+                ram_gb=ram_val,
+                cpu_cores=cpu_val,
+                hardware_class=p.get("hardware_class", "nvidia_t4"),
+                workers_per_device=workers_val,
+                samples=samples_val,
+                confidence=conf_val,
+                applied_run_ids=p.get("applied_run_ids"),
+                applied_job_ids=p.get("applied_job_ids"),
+                migrated_legacy_job_ids=p.get("migrated_legacy_job_ids"),
+                legacy_job_ids=p.get("legacy_job_ids"),
+                schema_version=p.get("schema_version"),
+            )
+    except Exception as e:
+        err_msg = f"Failed to load and validate profiles database {path}: {e}"
+        raise ProfileLoadException(err_msg) from e
+
+    target._profiles = staging._profiles
+    return target
+
+
 def reconcile_and_persist_profiles(
     profiles_path: Path | str,
     reconciler: ExecutionReconciler,
@@ -627,40 +732,7 @@ def reconcile_and_persist_profiles(
         # 1. Reload latest persisted profiles from disk into a fresh temporary estimator
         temp_estimator = ProfileDurationEstimator(default_fps=estimator.default_fps)
         if path.exists():
-            try:
-                content = path.read_text(encoding="utf-8")
-                prof_data = json.loads(content)
-                if not isinstance(prof_data, list):
-                    raise ValueError(f"Profiles database {path} must contain a JSON array, got {type(prof_data).__name__}")
-                for idx, p in enumerate(prof_data):
-                    if not isinstance(p, dict):
-                        raise ValueError(f"Profile record at index {idx} in {path} is not a valid JSON object")
-                    if "env_id" not in p or "model" not in p or "fps" not in p:
-                        raise ValueError(f"Profile record at index {idx} in {path} missing required fields ('env_id', 'model', 'fps')")
-                    fps_val = float(p["fps"])
-                    if fps_val <= 0:
-                        raise ValueError(f"Profile record at index {idx} in {path} has invalid fps {fps_val}")
-                    temp_estimator.register_profile(
-                        env_id=p["env_id"],
-                        model=p["model"],
-                        fps=fps_val,
-                        vram_gb=p.get("vram_gb", 0.5),
-                        ram_gb=p.get("ram_gb", 1.5),
-                        cpu_cores=p.get("cpu_cores", 1.0),
-                        hardware_class=p.get("hardware_class", "nvidia_t4"),
-                        workers_per_device=p.get("workers_per_device", 1),
-                        samples=p.get("samples", 1),
-                        confidence=p.get("confidence", 1.0),
-                        applied_run_ids=p.get("applied_run_ids"),
-                        applied_job_ids=p.get("applied_job_ids"),
-                        migrated_legacy_job_ids=p.get("migrated_legacy_job_ids"),
-                        legacy_job_ids=p.get("legacy_job_ids"),
-                        schema_version=p.get("schema_version"),
-                    )
-            except Exception as e:
-                err_msg = f"Failed to load and validate profiles database {path}: {e}"
-                sys.stderr.write(f"[ERROR AccelPack] {err_msg}\n")
-                raise ProfileLoadException(err_msg) from e
+            load_and_validate_profiles(path, estimator=temp_estimator)
         else:
             # If path does not exist yet on disk, inherit current in-memory estimator state as initial baseline
             temp_estimator._profiles = dict(estimator._profiles)

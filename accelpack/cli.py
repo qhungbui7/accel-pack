@@ -9,6 +9,7 @@ import os
 import sys
 import uuid
 from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 from accelpack.estimator import ProfileDurationEstimator
 from accelpack.models import Instance, Job, ObjectiveMode, PackingStrategy
@@ -20,11 +21,20 @@ from accelpack.reconciliation import (
     LockAcquisitionException,
     ProfileLoadException,
     ReplayResult,
+    _reject_non_standard_json_constants,
     atomic_save_json,
     file_lock,
+    load_and_validate_profiles,
     reconcile_and_persist_profiles,
 )
 from accelpack.scheduler import AccelPackScheduler, QuotaExceededException
+
+# Exit status codes
+EXIT_SUCCESS = 0
+EXIT_INPUT_ERROR = 1          # Invalid arguments, file not found, unparseable/invalid JSON
+EXIT_SCHEDULING_ERROR = 2     # Preflight blockers, QuotaExceededException, scheduling failure
+EXIT_PERSISTENCE_ERROR = 3    # Lock acquisition failure, history persistence failure, unpersisted run_id
+EXIT_PARTIAL_PERSISTENCE = 4  # History saved, but profile persistence failed
 
 
 def load_or_assign_execution_record(record_path: Path | str) -> Dict[str, Any]:
@@ -37,7 +47,7 @@ def load_or_assign_execution_record(record_path: Path | str) -> Dict[str, Any]:
         with file_lock(path):
             try:
                 content = path.read_text(encoding="utf-8")
-                data = json.loads(content)
+                data = json.loads(content, parse_constant=_reject_non_standard_json_constants)
             except Exception as e:
                 raise RuntimeError(f"Failed to read job record file {path}: {e}") from e
 
@@ -63,7 +73,7 @@ def load_or_assign_execution_record(record_path: Path | str) -> Dict[str, Any]:
         ) from e
 
 
-def main():
+def main() -> int:
     parser = argparse.ArgumentParser(description="AccelPack: Multi-Accelerator Quota-Preserving Scheduler")
     parser.add_argument("--instances", type=str, required=True, help="Path to JSON file with available instances/nodes")
     parser.add_argument("--jobs", type=str, required=True, help="Path to JSON file with jobs to schedule")
@@ -109,28 +119,27 @@ def main():
     reconciler = ExecutionReconciler(history_file=args.history) if args.history else None
     estimator = ProfileDurationEstimator(default_fps=100.0)
 
-    # Step A: Load profiles first (if provided) as baseline/prior state
-    if args.profiles and Path(args.profiles).exists():
-        try:
-            prof_data = json.loads(Path(args.profiles).read_text(encoding="utf-8"))
-            for p in prof_data:
-                estimator.register_profile(
-                    env_id=p["env_id"],
-                    model=p["model"],
-                    fps=p["fps"],
-                    vram_gb=p.get("vram_gb", 0.5),
-                    ram_gb=p.get("ram_gb", 1.5),
-                    cpu_cores=p.get("cpu_cores", 1.0),
-                    hardware_class=p.get("hardware_class", "nvidia_t4"),
-                    workers_per_device=p.get("workers_per_device", 1),
-                    samples=p.get("samples", 1),
-                    confidence=p.get("confidence", 1.0),
-                    applied_run_ids=p.get("applied_run_ids"),
-                    applied_job_ids=p.get("applied_job_ids"),
-                    migrated_legacy_job_ids=p.get("migrated_legacy_job_ids"),
-                )
-        except Exception as e:
-            sys.stderr.write(f"[WARN AccelPack] Could not load profiles database {args.profiles}: {e}\n")
+    # Check history file load error unconditionally (fail closed on malformed history)
+    if reconciler:
+        if reconciler.load_error is not None:
+            sys.stderr.write(f"[ERROR AccelPack] Failed to load history file: {reconciler.load_error}\n")
+            return EXIT_INPUT_ERROR
+        if reconciler.history_file and not reconciler.history_file.exists() and not args.record_job:
+            sys.stderr.write(f"[ERROR AccelPack] History database not found: {reconciler.history_file}\n")
+            return EXIT_INPUT_ERROR
+
+    # Step A: Load profiles strictly through load_and_validate_profiles (fail closed)
+    if args.profiles:
+        prof_path = Path(args.profiles)
+        if prof_path.exists():
+            try:
+                load_and_validate_profiles(prof_path, estimator=estimator)
+            except ProfileLoadException as e:
+                sys.stderr.write(f"[ERROR AccelPack] Failed to load profiles database: {e}\n")
+                return EXIT_INPUT_ERROR
+        elif not args.record_job:
+            sys.stderr.write(f"[ERROR AccelPack] Profiles database not found: {prof_path}\n")
+            return EXIT_INPUT_ERROR
 
     # Step B: Replay unapplied historical execution records into estimator (if history provided)
     if reconciler and reconciler.history:
@@ -145,27 +154,36 @@ def main():
                 print(f"[OK] Migrated {replay_res.migrations_count} legacy profile marker(s) to historical execution run IDs.")
         except HistoryLoadException as e:
             sys.stderr.write(f"[ERROR AccelPack] Failed to load history file: {e}\n")
-            return
+            return EXIT_INPUT_ERROR
         except ProfileLoadException as e:
             sys.stderr.write(f"[ERROR AccelPack] Failed to load profiles database: {e}\n")
-            return
+            return EXIT_INPUT_ERROR
         except LockAcquisitionException as e:
             sys.stderr.write(f"[ERROR AccelPack] Lock acquisition failed: {e}\n")
-            return
+            return EXIT_PERSISTENCE_ERROR
         except Exception as e:
             sys.stderr.write(f"[ERROR AccelPack] Failed to replay history into profiles: {e}\n")
+            return EXIT_PERSISTENCE_ERROR
 
+    partial_persistence = False
     # Record completed job if requested
-    if args.record_job and Path(args.record_job).exists() and reconciler:
+    if args.record_job:
         run_path = Path(args.record_job)
+        if not run_path.exists():
+            sys.stderr.write(f"[ERROR AccelPack] Job record file not found: {run_path}\n")
+            return EXIT_INPUT_ERROR
+        if not reconciler:
+            sys.stderr.write(f"[ERROR AccelPack] --record-job requires --history <file>\n")
+            return EXIT_INPUT_ERROR
+
         try:
             run_data = load_or_assign_execution_record(run_path)
         except RuntimeError as e:
             sys.stderr.write(f"[ERROR AccelPack] {e}\n")
-            return
+            return EXIT_PERSISTENCE_ERROR
         except Exception as e:
             sys.stderr.write(f"[ERROR AccelPack] Failed to read job record file {run_path}: {e}\n")
-            return
+            return EXIT_INPUT_ERROR
 
         # Step 1: Record into history
         history_persisted = False
@@ -192,16 +210,16 @@ def main():
             print(f"[OK] Recorded completed job {run_data['job_id']} (run_id: {run_data['run_id']}) into history.")
         except HistoryLoadException as e:
             sys.stderr.write(f"[ERROR AccelPack] Failed to load history file: {e}\n")
-            return
+            return EXIT_INPUT_ERROR
         except HistoryPersistenceException as e:
             sys.stderr.write(f"[ERROR AccelPack] Failed to persist job execution history: {e}\n")
-            return
+            return EXIT_PERSISTENCE_ERROR
         except LockAcquisitionException as e:
             sys.stderr.write(f"[ERROR AccelPack] Failed to acquire lock to record job: {e}\n")
-            return
+            return EXIT_PERSISTENCE_ERROR
         except Exception as e:
             sys.stderr.write(f"[ERROR AccelPack] Failed to record job summary: {e}\n")
-            return
+            return EXIT_PERSISTENCE_ERROR
 
         # Step 2: Persist updated profiles atomically and under profile lock if requested
         if history_persisted and args.profiles:
@@ -209,16 +227,19 @@ def main():
                 reconcile_and_persist_profiles(args.profiles, reconciler, estimator, save_fn=atomic_save_json)
                 print(f"[OK] Persisted {len(estimator.to_dict_list())} updated profiles to {args.profiles}")
             except ProfileLoadException as e:
+                partial_persistence = True
                 sys.stderr.write(
                     f"[ERROR AccelPack] History record was saved, but existing profiles database could not be loaded: {e}. "
                     f"Original profile file was preserved without changes.\n"
                 )
             except LockAcquisitionException as e:
+                partial_persistence = True
                 sys.stderr.write(
                     f"[ERROR AccelPack] History record was saved, but lock acquisition failed for {args.profiles}: {e}. "
                     f"Subsequent replay will recover profile calibrations from history.\n"
                 )
             except Exception as e:
+                partial_persistence = True
                 sys.stderr.write(
                     f"[ERROR AccelPack] History record was saved, but failed to persist updated profiles to {args.profiles}: {e}. "
                     f"Subsequent replay will recover profile calibrations from history.\n"
@@ -245,58 +266,78 @@ def main():
             print("[WARN] --accuracy-report requires --history <file>.")
 
     # 2. Parse instances and jobs
-    instances_data = json.loads(Path(args.instances).read_text(encoding="utf-8"))
-    instances = [
-        Instance(
-            instance_id=i["instance_id"],
-            account_id=i.get("account_id"),
-            device_count=i.get("device_count", 2),
-            remaining_quota_h=i.get("remaining_quota_h", 30.0),
-            max_session_h=i.get("max_session_h", 11.0),
-            vram_per_device_gb=i.get("vram_per_device_gb", 16.0),
-            host_ram_gb=i.get("host_ram_gb", 30.0),
-            host_cpu_cores=i.get("host_cpu_cores", 4.0),
-            slots_per_device=i.get("slots_per_device", 1),
-            debit_rate=i.get("debit_rate", 1.0),
-            reset_at=i.get("reset_at"),
-            must_finish_before_reset=i.get("must_finish_before_reset", False),
-            hardware_class=i.get("hardware_class", "nvidia_t4"),
-            concurrency_slowdown_factors=i.get("concurrency_slowdown_factors", {1: 1.0, 2: 1.30, 3: 1.65, 4: 2.0}),
-            max_cpu_oversubscription_ratio=i.get("max_cpu_oversubscription_ratio"),
-            metadata=i.get("metadata", {}),
-        )
-        for i in instances_data
-    ]
-
-    jobs_data = json.loads(Path(args.jobs).read_text(encoding="utf-8"))
-    jobs = []
-    for j in jobs_data:
-        duration_h = j["duration_h"]
-        # Re-estimate duration from loaded profiles if requested and steps provided
-        if args.reestimate and "metadata" in j and "steps" in j["metadata"]:
-            steps = j["metadata"]["steps"]
-            env_id = j["metadata"].get("env", "")
-            model = j["metadata"].get("model", "")
-            hw = j.get("hardware_class", "nvidia_t4")
-            duration_h = estimator.estimate_duration_h(steps, env_id=env_id, model=model, hardware_class=hw)
-
-        jobs.append(
-            Job(
-                job_id=j["job_id"],
-                duration_h=duration_h,
-                vram_gb=j.get("vram_gb", 0.5),
-                ram_gb=j.get("ram_gb", 1.5),
-                cpu_cores=j.get("cpu_cores", 1.0),
-                priority=j.get("priority", 1.0),
-                resumable=j.get("resumable", False),
-                segments=j.get("segments"),
-                hardware_class=j.get("hardware_class"),
-                depends_on=j.get("depends_on"),
-                parent_job_id=j.get("parent_job_id"),
-                segment_index=j.get("segment_index"),
-                metadata=j.get("metadata", {}),
+    instances_file = Path(args.instances)
+    if not instances_file.exists():
+        sys.stderr.write(f"[ERROR AccelPack] Instances file not found: {instances_file}\n")
+        return EXIT_INPUT_ERROR
+    try:
+        instances_data = json.loads(instances_file.read_text(encoding="utf-8"), parse_constant=_reject_non_standard_json_constants)
+        if not isinstance(instances_data, list):
+            raise ValueError(f"Instances file {instances_file} must contain a JSON array, got {type(instances_data).__name__}")
+        instances = [
+            Instance(
+                instance_id=i["instance_id"],
+                account_id=i.get("account_id"),
+                device_count=i.get("device_count", 2),
+                remaining_quota_h=i.get("remaining_quota_h", 30.0),
+                max_session_h=i.get("max_session_h", 11.0),
+                vram_per_device_gb=i.get("vram_per_device_gb", 16.0),
+                host_ram_gb=i.get("host_ram_gb", 30.0),
+                host_cpu_cores=i.get("host_cpu_cores", 4.0),
+                slots_per_device=i.get("slots_per_device", 1),
+                debit_rate=i.get("debit_rate", 1.0),
+                reset_at=i.get("reset_at"),
+                must_finish_before_reset=i.get("must_finish_before_reset", False),
+                hardware_class=i.get("hardware_class", "nvidia_t4"),
+                concurrency_slowdown_factors=i.get("concurrency_slowdown_factors", {1: 1.0, 2: 1.30, 3: 1.65, 4: 2.0}),
+                max_cpu_oversubscription_ratio=i.get("max_cpu_oversubscription_ratio"),
+                metadata=i.get("metadata", {}),
             )
-        )
+            for i in instances_data
+        ]
+    except Exception as e:
+        sys.stderr.write(f"[ERROR AccelPack] Failed to parse instances from {instances_file}: {e}\n")
+        return EXIT_INPUT_ERROR
+
+    jobs_file = Path(args.jobs)
+    if not jobs_file.exists():
+        sys.stderr.write(f"[ERROR AccelPack] Jobs file not found: {jobs_file}\n")
+        return EXIT_INPUT_ERROR
+    try:
+        jobs_data = json.loads(jobs_file.read_text(encoding="utf-8"), parse_constant=_reject_non_standard_json_constants)
+        if not isinstance(jobs_data, list):
+            raise ValueError(f"Jobs file {jobs_file} must contain a JSON array, got {type(jobs_data).__name__}")
+        jobs = []
+        for j in jobs_data:
+            duration_h = j["duration_h"]
+            # Re-estimate duration from loaded profiles if requested and steps provided
+            if args.reestimate and "metadata" in j and "steps" in j["metadata"]:
+                steps = j["metadata"]["steps"]
+                env_id = j["metadata"].get("env", "")
+                model = j["metadata"].get("model", "")
+                hw = j.get("hardware_class", "nvidia_t4")
+                duration_h = estimator.estimate_duration_h(steps, env_id=env_id, model=model, hardware_class=hw)
+
+            jobs.append(
+                Job(
+                    job_id=j["job_id"],
+                    duration_h=duration_h,
+                    vram_gb=j.get("vram_gb", 0.5),
+                    ram_gb=j.get("ram_gb", 1.5),
+                    cpu_cores=j.get("cpu_cores", 1.0),
+                    priority=j.get("priority", 1.0),
+                    resumable=j.get("resumable", False),
+                    segments=j.get("segments"),
+                    hardware_class=j.get("hardware_class"),
+                    depends_on=j.get("depends_on"),
+                    parent_job_id=j.get("parent_job_id"),
+                    segment_index=j.get("segment_index"),
+                    metadata=j.get("metadata", {}),
+                )
+            )
+    except Exception as e:
+        sys.stderr.write(f"[ERROR AccelPack] Failed to parse jobs from {jobs_file}: {e}\n")
+        return EXIT_INPUT_ERROR
 
     # 3. Preflight Validation stage
     if not args.skip_preflight:
@@ -310,7 +351,7 @@ def main():
         print(report.format_text())
         if not report.passed and not args.ignore_blockers:
             print(f"[ERROR] Preflight validation failed with {len(report.blockers)} blocker(s). Use --ignore-blockers to override.")
-            sys.exit(1)
+            return EXIT_SCHEDULING_ERROR
 
     # 4. Scheduling stage
     scheduler = AccelPackScheduler(
@@ -331,7 +372,10 @@ def main():
         plan = scheduler.schedule(jobs, instances, allow_partial=args.allow_partial)
     except QuotaExceededException as e:
         print(f"[ERROR] Scheduling failed: {e}")
-        sys.exit(2)
+        return EXIT_SCHEDULING_ERROR
+    except Exception as e:
+        print(f"[ERROR] Scheduling failed: {e}")
+        return EXIT_SCHEDULING_ERROR
 
     print(plan.summary())
 
@@ -388,6 +432,12 @@ def main():
         Path(args.output).write_text(json.dumps(export_data, indent=2), encoding="utf-8")
         print(f"\n[OK] Plan exported to {args.output}")
 
+    return EXIT_PARTIAL_PERSISTENCE if partial_persistence else EXIT_SUCCESS
+
+
+def entry_point() -> None:
+    raise SystemExit(main())
+
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

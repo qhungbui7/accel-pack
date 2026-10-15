@@ -14,7 +14,17 @@ from accelpack.models import (
 from accelpack.scheduler import AccelPackScheduler, QuotaExceededException
 from accelpack.estimator import ProfileDurationEstimator, ProfileRecord
 from accelpack.preflight import PreflightValidator, PreflightReport, PreflightIssue
-from accelpack.reconciliation import ExecutionReconciler, JobExecutionRecord, SessionReconciliationReport
+from accelpack.reconciliation import (
+    ExecutionReconciler,
+    JobExecutionRecord,
+    SessionReconciliationReport,
+    load_and_validate_profiles,
+    reconcile_and_persist_profiles,
+    ProfileLoadException,
+    HistoryLoadException,
+    HistoryPersistenceException,
+    LockAcquisitionException,
+)
 
 __all__ = [
     "DeviceSlot",
@@ -34,4 +44,10 @@ __all__ = [
     "ExecutionReconciler",
     "JobExecutionRecord",
     "SessionReconciliationReport",
+    "load_and_validate_profiles",
+    "reconcile_and_persist_profiles",
+    "ProfileLoadException",
+    "HistoryLoadException",
+    "HistoryPersistenceException",
+    "LockAcquisitionException",
 ]
