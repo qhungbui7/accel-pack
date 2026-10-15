@@ -296,17 +296,18 @@ class AccelPackScheduler:
                         continue
 
                     # In BALANCE mode:
-                    # The primary goal is equalizing remaining quota across instances (water-filling).
-                    # So the primary rank must be -post_quota_rem (highest remaining quota gets job).
-                    # Secondary rank: minimize device load imbalance within the instance.
-                    # Tertiary rank: if there is an idle partner on this already-active instance, fill it!
+                    # PRIORITY 1: Fill an idle partner device on an already-active instance.
+                    # Billed container cost is already sunk for the running device, so filling the idle device
+                    # has marginal billed cost = 0 and eliminates 50% idle GPU billing waste!
                     currently_active = ip.is_active
-                    has_idle_partner = any(s.load_h == 0 for s in ip.slots if s is not slot) if currently_active else False
-                    partner_score = -1.0 if has_idle_partner else 0.0
+                    is_filling_idle_partner = currently_active and slot.load_h == 0 and any(s.load_h > 0 for s in ip.slots)
+                    partner_rank = 0 if is_filling_idle_partner else 1
 
-                    # Round post_quota_rem to 0.1h bins to allow partner balancing when quotas are close
+                    # PRIORITY 2: Waterfill quota - direct work to the instance with highest remaining quota.
                     quota_bin = -round(post_quota_rem, 1)
-                    candidate_choices.append((quota_bin, partner_score, hypothetical_imbalance, ip, slot))
+
+                    # PRIORITY 3: Minimize device load imbalance within the instance.
+                    candidate_choices.append((partner_rank, quota_bin, hypothetical_imbalance, ip, slot))
 
             if candidate_choices:
                 candidate_choices.sort(key=lambda item: (item[0], item[1], item[2]))
