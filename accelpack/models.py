@@ -392,16 +392,24 @@ class ExecutionPlan:
         return accts
 
     def account_remaining_quota(self) -> Dict[str, float]:
-        """Aggregate remaining quota hours after all planned active instance debits, grouped by account_id."""
+        """Aggregate remaining quota hours after all planned active instance debits, grouped by account_id.
+        Authoritative pool quota uses conservative minimum declared quota across all instances in that account,
+        eliminating list-order dependence for conflicting declarations.
+        """
         acct_billed = self.account_billed_quota()
-        rem_map: Dict[str, float] = {}
+        acct_pools: Dict[str, float] = {}
         for ip in self.instance_plans:
             acc_id = ip.instance.account_id or ip.instance.instance_id
-            if acc_id not in rem_map:
-                pool_quota = ip.instance.remaining_quota_h
-                billed = acct_billed.get(acc_id, 0.0)
-                rem_map[acc_id] = max(0.0, pool_quota - billed)
-        return rem_map
+            quota = ip.instance.remaining_quota_h
+            if acc_id not in acct_pools:
+                acct_pools[acc_id] = quota
+            else:
+                acct_pools[acc_id] = min(acct_pools[acc_id], quota)
+
+        return {
+            acc_id: max(0.0, pool_quota - acct_billed.get(acc_id, 0.0))
+            for acc_id, pool_quota in acct_pools.items()
+        }
 
     def summary(self) -> str:
         start_times, finish_times = self.instance_schedule_timings()

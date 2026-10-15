@@ -7,6 +7,18 @@ from typing import Any, Dict, List, Optional, Tuple
 from accelpack.models import Job
 
 
+def is_execution_run_id(item: str) -> bool:
+    """Determines whether an identifier represents an execution run ID or a logical job ID.
+    Run IDs start with 'run_' (UUID-based execution IDs) or 'legacy_' with hash format 'legacy_{job}_{idx}_{hash}'."""
+    if item.startswith("run_"):
+        return True
+    if item.startswith("legacy_"):
+        parts = item.split("_")
+        if len(parts) >= 4 and len(parts[-1]) == 8 and all(c in "0123456789abcdef" for c in parts[-1]):
+            return True
+    return False
+
+
 @dataclass
 class ProfileRecord:
     throughput: float             # Steps/sec or FPS
@@ -80,7 +92,7 @@ class ProfileDurationEstimator:
         clean_migrated_ids: List[str] = []
 
         for item in applied_runs:
-            if item.startswith("run_") or item.startswith("legacy_"):
+            if is_execution_run_id(item):
                 if item not in clean_run_ids:
                     clean_run_ids.append(item)
             elif item in already_migrated:
@@ -91,7 +103,7 @@ class ProfileDurationEstimator:
                     clean_legacy_ids.append(item)
 
         for item in legacy_jobs:
-            if item.startswith("run_") or item.startswith("legacy_"):
+            if is_execution_run_id(item):
                 if item not in clean_run_ids:
                     clean_run_ids.append(item)
             elif item in already_migrated:

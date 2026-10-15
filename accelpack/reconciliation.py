@@ -7,6 +7,8 @@ running separate diagnostic benchmark sessions.
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import hashlib
 import json
 import math
@@ -24,6 +26,40 @@ from accelpack.estimator import ProfileDurationEstimator
 class HistoryPersistenceException(Exception):
     """Raised when writing execution history to persistent storage fails."""
     pass
+
+
+def atomic_save_json(target_path: Path | str, data: Any) -> None:
+    """Durably and atomically writes JSON data to target_path using a temporary file and atomic rename."""
+    path = Path(target_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f"{path.name}.tmp.{uuid.uuid4().hex[:8]}")
+    payload = json.dumps(data, indent=2)
+    try:
+        tmp_path.write_text(payload, encoding="utf-8")
+        os.replace(tmp_path, path)
+    finally:
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except Exception:
+                pass
+
+
+class ReplayResult(int):
+    """Result of replay_into_estimator representing newly replayed executions count
+    while tracking whether profile state was modified by legacy migrations.
+    Subclasses int for full backward compatibility."""
+
+    replayed_count: int
+    migrations_count: int
+    modified: bool
+
+    def __new__(cls, replayed: int, migrations: int = 0):
+        obj = super().__new__(cls, replayed)
+        obj.replayed_count = replayed
+        obj.migrations_count = migrations
+        obj.modified = (replayed > 0) or (migrations > 0)
+        return obj
 
 
 @dataclass
@@ -91,6 +127,60 @@ class ExecutionReconciler:
                 # Preserve empty in-memory list but warn visibly
                 sys.stderr.write(f"[WARN AccelPack] {self.load_error}\n")
 
+    def _file_lock(self):
+        """Cross-process advisory lock to serialize read, duplicate check, append, and persistence."""
+        if not self.history_file:
+            @contextlib.contextmanager
+            def _noop():
+                yield
+            return _noop()
+
+        lock_path = self.history_file.with_name(f"{self.history_file.name}.lock")
+        try:
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR)
+        @contextlib.contextmanager
+        def _flock():
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+                yield
+            finally:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                finally:
+                    os.close(fd)
+        return _flock()
+
+    def _reload_history_unlocked(self):
+        """Reloads latest history from disk under active lock to avoid stale snapshots,
+        preserving object identity for existing in-memory records."""
+        if self.history_file and self.history_file.exists():
+            try:
+                data = json.loads(self.history_file.read_text(encoding="utf-8"))
+                existing_by_run_id = {r.run_id: r for r in self.history}
+                recs = []
+                for idx, r in enumerate(data):
+                    rid = r.get("run_id")
+                    if not rid:
+                        jid = r.get("job_id", "job")
+                        ts = r.get("timestamp", str(idx))
+                        steps = r.get("steps", 0)
+                        dur = r.get("actual_duration_h", 0.0)
+                        content_sig = f"{jid}:{ts}:{steps}:{dur}:{idx}"
+                        rid = f"legacy_{jid}_{idx}_{hashlib.sha256(content_sig.encode('utf-8')).hexdigest()[:8]}"
+                        r["run_id"] = rid
+                    if rid in existing_by_run_id:
+                        recs.append(existing_by_run_id[rid])
+                    else:
+                        recs.append(JobExecutionRecord(**r))
+                self.history = recs
+                self.load_error = None
+            except Exception as e:
+                self.load_error = f"Corrupted or invalid history file {self.history_file}: {e}"
+                sys.stderr.write(f"[WARN AccelPack] {self.load_error}\n")
+
     def _persist_history(self):
         if self.history_file:
             tmp_file = None
@@ -133,89 +223,100 @@ class ExecutionReconciler:
         cpu_busy_pct: Optional[float] = None,
         estimator: Optional[ProfileDurationEstimator] = None,
     ) -> JobExecutionRecord:
-        """Records a completed job execution and updates the duration estimator profile idempotently."""
+        """Records a completed job execution and updates the duration estimator profile idempotently.
+        Serializes read, duplicate check, append, and persistence under cross-process file lock.
+        Separates history deduplication from estimator calibration so retrying with an estimator
+        repairs missing calibration state without duplicating history records.
+        """
         effective_run_id = run_id or f"run_{job_id}_{uuid.uuid4().hex[:12]}"
 
-        # Check if already recorded in self.history (idempotent submission by run_id)
-        for existing_h in self.history:
-            if existing_h.run_id == effective_run_id:
-                return existing_h
+        with self._file_lock():
+            # 1. Reload latest state under lock to prevent lost updates from concurrent writers
+            self._reload_history_unlocked()
 
-        actual_fps = (steps / (actual_duration_h * 3600.0)) if actual_duration_h > 0 else 0.0
+            # 2. Check if already recorded in self.history (idempotent submission by run_id)
+            existing_rec: Optional[JobExecutionRecord] = None
+            for existing_h in self.history:
+                if existing_h.run_id == effective_run_id:
+                    existing_rec = existing_h
+                    break
 
-        missing = []
-        if peak_vram_gb is None:
-            missing.append("peak_vram_gb")
-        if peak_ram_gb is None:
-            missing.append("peak_ram_gb")
-        if cpu_busy_pct is None:
-            missing.append("cpu_busy_pct")
+            if existing_rec is not None:
+                rec = existing_rec
+            else:
+                actual_fps = (steps / (actual_duration_h * 3600.0)) if actual_duration_h > 0 else 0.0
 
-        rec = JobExecutionRecord(
-            job_id=job_id,
-            env_id=env_id,
-            model=model,
-            steps=steps,
-            predicted_duration_h=predicted_duration_h,
-            actual_duration_h=actual_duration_h,
-            success=success,
-            instance_id=instance_id,
-            run_id=effective_run_id,
-            device_index=device_index,
-            concurrent_workers_on_device=concurrent_workers_on_device,
-            hardware_class=hardware_class,
-            peak_vram_gb=peak_vram_gb,
-            peak_ram_gb=peak_ram_gb,
-            cpu_busy_pct=cpu_busy_pct,
-            measured_fps=round(actual_fps, 1),
-            missing_telemetry=missing,
-        )
-        self.history.append(rec)
-        try:
-            self._persist_history()
-        except HistoryPersistenceException:
-            self.history.pop()
-            raise
+                missing = []
+                if peak_vram_gb is None:
+                    missing.append("peak_vram_gb")
+                if peak_ram_gb is None:
+                    missing.append("peak_ram_gb")
+                if cpu_busy_pct is None:
+                    missing.append("cpu_busy_pct")
 
-        # Update estimator if provided and job succeeded
-        if estimator and success and actual_fps > 0:
+                rec = JobExecutionRecord(
+                    job_id=job_id,
+                    env_id=env_id,
+                    model=model,
+                    steps=steps,
+                    predicted_duration_h=predicted_duration_h,
+                    actual_duration_h=actual_duration_h,
+                    success=success,
+                    instance_id=instance_id,
+                    run_id=effective_run_id,
+                    device_index=device_index,
+                    concurrent_workers_on_device=concurrent_workers_on_device,
+                    hardware_class=hardware_class,
+                    peak_vram_gb=peak_vram_gb,
+                    peak_ram_gb=peak_ram_gb,
+                    cpu_busy_pct=cpu_busy_pct,
+                    measured_fps=round(actual_fps, 1),
+                    missing_telemetry=missing,
+                )
+                self.history.append(rec)
+                try:
+                    self._persist_history()
+                except HistoryPersistenceException:
+                    self.history.pop()
+                    raise
+
+        # 3. Update estimator if provided and job succeeded (handles both new records and retried historical records)
+        if estimator and rec.success and rec.measured_fps and rec.measured_fps > 0:
             existing = estimator.get_profile(
-                env_id=env_id,
-                model=model,
-                hardware_class=hardware_class,
-                workers_per_device=concurrent_workers_on_device,
+                env_id=rec.env_id,
+                model=rec.model,
+                hardware_class=rec.hardware_class,
+                workers_per_device=rec.concurrent_workers_on_device,
             )
             applied = list(existing.applied_run_ids) if existing else []
-            if effective_run_id in applied:
-                return rec
+            if rec.run_id not in applied:
+                applied.append(rec.run_id)
+                migrated = list(existing.migrated_legacy_job_ids) if existing else []
+                legacy = list(existing.legacy_job_ids) if existing else []
 
-            applied.append(effective_run_id)
-            migrated = list(existing.migrated_legacy_job_ids) if existing else []
-            legacy = list(existing.legacy_job_ids) if existing else []
+                prior_fps = existing.throughput if existing else (estimator.default_fps / (1.0 + 0.3 * (rec.concurrent_workers_on_device - 1)))
+                new_fps = (1.0 - self.learning_rate) * prior_fps + self.learning_rate * rec.measured_fps
+                new_samples = (existing.samples + 1) if existing else 1
+                new_conf = min(0.95, (existing.confidence + 0.05) if existing else 0.70)
+                new_vram = max(existing.vram_gb, rec.peak_vram_gb or 0.5) if existing else (rec.peak_vram_gb or 0.5)
+                new_ram = max(existing.ram_gb, rec.peak_ram_gb or 1.5) if existing else (rec.peak_ram_gb or 1.5)
+                new_cpu = existing.cpu_cores if existing else 1.0
 
-            prior_fps = existing.throughput if existing else (estimator.default_fps / (1.0 + 0.3 * (concurrent_workers_on_device - 1)))
-            new_fps = (1.0 - self.learning_rate) * prior_fps + self.learning_rate * actual_fps
-            new_samples = (existing.samples + 1) if existing else 1
-            new_conf = min(0.95, (existing.confidence + 0.05) if existing else 0.70)
-            new_vram = max(existing.vram_gb, peak_vram_gb or 0.5) if existing else (peak_vram_gb or 0.5)
-            new_ram = max(existing.ram_gb, peak_ram_gb or 1.5) if existing else (peak_ram_gb or 1.5)
-            new_cpu = existing.cpu_cores if existing else 1.0
-
-            estimator.register_profile(
-                env_id=env_id,
-                model=model,
-                fps=new_fps,
-                vram_gb=new_vram,
-                ram_gb=new_ram,
-                cpu_cores=new_cpu,
-                hardware_class=hardware_class,
-                workers_per_device=concurrent_workers_on_device,
-                samples=new_samples,
-                confidence=new_conf,
-                applied_run_ids=applied,
-                applied_job_ids=legacy,
-                migrated_legacy_job_ids=migrated,
-            )
+                estimator.register_profile(
+                    env_id=rec.env_id,
+                    model=rec.model,
+                    fps=new_fps,
+                    vram_gb=new_vram,
+                    ram_gb=new_ram,
+                    cpu_cores=new_cpu,
+                    hardware_class=rec.hardware_class,
+                    workers_per_device=rec.concurrent_workers_on_device,
+                    samples=new_samples,
+                    confidence=new_conf,
+                    applied_run_ids=applied,
+                    applied_job_ids=legacy,
+                    migrated_legacy_job_ids=migrated,
+                )
 
         return rec
 
@@ -301,7 +402,7 @@ class ExecutionReconciler:
             "by_stratum": strata_report,
         }
 
-    def replay_into_estimator(self, estimator: ProfileDurationEstimator) -> int:
+    def replay_into_estimator(self, estimator: ProfileDurationEstimator) -> ReplayResult:
         """Replays all successful historical job executions to calibrate estimator profiles,
         skipping records that have already been incorporated into existing profiles.
 
@@ -311,6 +412,7 @@ class ExecutionReconciler:
         Thereafter, deduplication is performed exclusively by execution run_id so subsequent
         runs of the same logical job are never silently suppressed.
         """
+        migrations_count = 0
         # Step 1: Explicit one-time migration of legacy profile markers
         for key, profile in estimator._profiles.items():
             if profile.legacy_job_ids:
@@ -333,6 +435,7 @@ class ExecutionReconciler:
                             profile.applied_run_ids.append(earliest.run_id)
                         if legacy_jid not in profile.migrated_legacy_job_ids:
                             profile.migrated_legacy_job_ids.append(legacy_jid)
+                        migrations_count += 1
                         if len(matching_runs) > 1:
                             sys.stderr.write(
                                 f"[WARN AccelPack] Legacy profile for {env_k}/{model_k} (workers={workers_k}) has "
@@ -342,6 +445,7 @@ class ExecutionReconciler:
                     else:
                         if legacy_jid not in profile.migrated_legacy_job_ids:
                             profile.migrated_legacy_job_ids.append(legacy_jid)
+                        migrations_count += 1
                         sys.stderr.write(
                             f"[WARN AccelPack] Legacy profile marker for job '{legacy_jid}' has no matching historical runs.\n"
                         )
@@ -391,5 +495,5 @@ class ExecutionReconciler:
                     migrated_legacy_job_ids=migrated,
                 )
                 count += 1
-        return count
+        return ReplayResult(count, migrations_count)
 

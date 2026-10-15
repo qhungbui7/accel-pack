@@ -1397,6 +1397,7 @@ def test_history_persistence_failure_surfaced_and_rolled_back(tmp_path, monkeypa
     record_file = tmp_path / "record.json"
     record_file.write_text(json.dumps({
         "job_id": "job_cli_fail",
+        "run_id": "run_cli_fail_001",
         "env_id": "env_cli",
         "model": "model_cli",
         "steps": 50000,
@@ -1499,6 +1500,366 @@ def test_shared_account_remaining_quota_summary_and_cli_export(tmp_path, monkeyp
         assert inst_json["quota_remaining_after_h"] == pytest.approx(6.0)
         # Instance-alone balance preserved for debugging
         assert inst_json["instance_alone_quota_remaining_h"] == pytest.approx(8.0)
+
+
+def test_concurrent_history_writers_preserve_all_records(tmp_path):
+    """Verify that multiple concurrent processes/threads recording to the same history file
+    do not overwrite each other's records, and simultaneous submissions of the same run_id
+    record exactly one entry."""
+    import concurrent.futures
+
+    history_file = tmp_path / "shared_history.json"
+
+    # Part A: Concurrent recording with distinct run IDs
+    num_writers = 8
+    def record_distinct(writer_idx):
+        rec = ExecutionReconciler(history_file=history_file)
+        return rec.record_job(
+            job_id=f"job_{writer_idx}",
+            env_id="cartpole",
+            model="mlp",
+            steps=100000,
+            predicted_duration_h=1.0,
+            actual_duration_h=1.0,
+            success=True,
+            instance_id=f"node_{writer_idx}",
+            run_id=f"run_distinct_{writer_idx}",
+        )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=num_writers) as executor:
+        results = list(executor.map(record_distinct, range(num_writers)))
+
+    assert len(results) == num_writers
+    final_reconciler = ExecutionReconciler(history_file=history_file)
+    assert len(final_reconciler.history) == num_writers
+    recorded_rids = {r.run_id for r in final_reconciler.history}
+    for i in range(num_writers):
+        assert f"run_distinct_{i}" in recorded_rids
+
+    # Part B: Simultaneous submissions of the exact same run_id across multiple writers
+    shared_run_id = "run_simultaneous_idempotent"
+    def record_same(writer_idx):
+        rec = ExecutionReconciler(history_file=history_file)
+        return rec.record_job(
+            job_id="shared_job",
+            env_id="cartpole",
+            model="mlp",
+            steps=100000,
+            predicted_duration_h=1.0,
+            actual_duration_h=1.0,
+            success=True,
+            instance_id=f"node_{writer_idx}",
+            run_id=shared_run_id,
+        )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+        same_results = list(executor.map(record_same, range(4)))
+
+    final_reconciler_2 = ExecutionReconciler(history_file=history_file)
+    assert len(final_reconciler_2.history) == num_writers + 1
+    shared_records = [r for r in final_reconciler_2.history if r.run_id == shared_run_id]
+    assert len(shared_records) == 1
+
+
+def test_failed_persistence_of_input_run_id_fail_closes(tmp_path, monkeypatch):
+    """Verify that when the input record JSON is read-only or its write fails,
+    the CLI aborts without recording to history, preventing divergent non-idempotent submissions."""
+    from accelpack import cli
+    import io
+    import sys
+
+    history_file = tmp_path / "history.json"
+    inst_file = tmp_path / "inst.json"
+    jobs_file = tmp_path / "jobs.json"
+    ro_dir = tmp_path / "ro_dir"
+    ro_dir.mkdir()
+    record_file = ro_dir / "read_only_record.json"
+
+    inst_file.write_text(json.dumps([{"instance_id": "n1", "device_count": 1, "remaining_quota_h": 10.0}]))
+    jobs_file.write_text(json.dumps([{"job_id": "dummy", "duration_h": 1.0}]))
+
+    # Input file with NO run_id
+    record_file.write_text(json.dumps({
+        "job_id": "job_ro",
+        "env_id": "cifar",
+        "model": "resnet",
+        "steps": 100000,
+        "predicted_duration_h": 1.0,
+        "actual_duration_h": 0.5,
+        "success": True,
+        "instance_id": "n1",
+    }))
+
+    # Make parent directory read-only so atomic temporary file creation fails
+    ro_dir.chmod(0o555)
+    try:
+        # Monkeypatch argv for CLI run
+        monkeypatch.setattr(
+            "sys.argv",
+            [
+                "accelpack.cli",
+                "--instances", str(inst_file),
+                "--jobs", str(jobs_file),
+                "--history", str(history_file),
+                "--record-job", str(record_file),
+            ],
+        )
+
+        out1 = io.StringIO()
+        err1 = io.StringIO()
+        monkeypatch.setattr(sys, "stdout", out1)
+        monkeypatch.setattr(sys, "stderr", err1)
+        cli.main()
+
+        # Must fail closed with error on first invocation
+        assert "Cannot persist generated run_id" in err1.getvalue()
+
+        # Second invocation with same read-only file
+        out2 = io.StringIO()
+        err2 = io.StringIO()
+        monkeypatch.setattr(sys, "stdout", out2)
+        monkeypatch.setattr(sys, "stderr", err2)
+        cli.main()
+        assert "Cannot persist generated run_id" in err2.getvalue()
+
+        # Verify that history is empty (never recorded without a durable run_id)
+        reconciler = ExecutionReconciler(history_file=history_file)
+        assert len(reconciler.history) == 0
+    finally:
+        # Restore write permission for cleanup
+        ro_dir.chmod(0o755)
+
+
+def test_legacy_migration_changes_persisted_even_with_zero_new_replays(tmp_path, monkeypatch):
+    """Verify that when a legacy profile marker matches an existing historical execution,
+    the migration modifies the profile, persists the profile file atomically even when
+    replayed_count == 0, and does not repeat migration on subsequent invocations."""
+    from accelpack import cli
+
+    history_file = tmp_path / "history.json"
+    profiles_file = tmp_path / "profiles.json"
+    inst_file = tmp_path / "inst.json"
+    jobs_file = tmp_path / "jobs.json"
+
+    # Exactly one matching historical run with run_id="run_legacy_matched"
+    history_records = [
+        {
+            "job_id": "legacy_task",
+            "run_id": "run_legacy_matched",
+            "env_id": "mujoco",
+            "model": "sac",
+            "steps": 100000,
+            "predicted_duration_h": 1.0,
+            "actual_duration_h": 1.0,
+            "success": True,
+            "instance_id": "node1",
+            "hardware_class": "nvidia_t4",
+            "concurrent_workers_on_device": 1,
+            "measured_fps": 100.0,
+        }
+    ]
+    history_file.write_text(json.dumps(history_records), encoding="utf-8")
+
+    # Initial profile with unmigrated legacy marker "legacy_task" in applied_job_ids
+    initial_profiles = [
+        {
+            "env_id": "mujoco",
+            "model": "sac",
+            "fps": 100.0,
+            "hardware_class": "nvidia_t4",
+            "workers_per_device": 1,
+            "samples": 1,
+            "confidence": 0.8,
+            "applied_job_ids": ["legacy_task"],
+        }
+    ]
+    profiles_file.write_text(json.dumps(initial_profiles), encoding="utf-8")
+
+    inst_file.write_text(json.dumps([{"instance_id": "n1", "device_count": 1, "remaining_quota_h": 10.0}]))
+    jobs_file.write_text(json.dumps([{"job_id": "dummy", "duration_h": 1.0}]))
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "accelpack.cli",
+            "--instances", str(inst_file),
+            "--jobs", str(jobs_file),
+            "--profiles", str(profiles_file),
+            "--history", str(history_file),
+        ],
+    )
+    cli.main()
+
+    # Verify that the saved profile file on disk reflects the migrated state
+    saved_profiles = json.loads(profiles_file.read_text(encoding="utf-8"))
+    prof = saved_profiles[0]
+    assert "run_legacy_matched" in prof["applied_run_ids"]
+    assert "legacy_task" in prof["migrated_legacy_job_ids"]
+
+    # Re-run CLI: verify that no re-migration occurs and profiles remain stable
+    import io
+    import sys
+    err_capture = io.StringIO()
+    monkeypatch.setattr(sys, "stderr", err_capture)
+    cli.main()
+    assert "[WARN AccelPack] Legacy profile" not in err_capture.getvalue()
+
+
+def test_retry_with_estimator_calibrates_existing_historical_record(tmp_path):
+    """Verify that calling record_job for an already-existing run_id with an uncalibrated estimator
+    incorporates the measurement into the estimator without duplicating history."""
+    history_file = tmp_path / "history.json"
+    reconciler = ExecutionReconciler(history_file=history_file)
+
+    # 1. Record without estimator
+    rec1 = reconciler.record_job(
+        job_id="uncalibrated_job",
+        env_id="env_a",
+        model="model_b",
+        steps=360000,
+        predicted_duration_h=1.0,
+        actual_duration_h=1.0,  # 100 FPS
+        success=True,
+        instance_id="node1",
+        run_id="run_retry_calib",
+        estimator=None,
+    )
+    assert len(reconciler.history) == 1
+
+    # 2. Resubmit same run_id with an estimator that has not yet applied this run
+    fresh_estimator = ProfileDurationEstimator(default_fps=50.0)
+    rec2 = reconciler.record_job(
+        job_id="uncalibrated_job",
+        env_id="env_a",
+        model="model_b",
+        steps=360000,
+        predicted_duration_h=1.0,
+        actual_duration_h=1.0,
+        success=True,
+        instance_id="node1",
+        run_id="run_retry_calib",
+        estimator=fresh_estimator,
+    )
+
+    # History not duplicated
+    assert len(reconciler.history) == 1
+    assert rec2 is rec1
+
+    # Estimator incorporated measurement exactly once
+    prof = fresh_estimator.get_profile("env_a", "model_b")
+    assert prof is not None
+    assert "run_retry_calib" in prof.applied_run_ids
+    assert prof.samples == 1
+
+    # 3. Resubmit third time: no duplicate moving-average shift
+    fps_after_first = prof.throughput
+    reconciler.record_job(
+        job_id="uncalibrated_job",
+        env_id="env_a",
+        model="model_b",
+        steps=360000,
+        predicted_duration_h=1.0,
+        actual_duration_h=1.0,
+        success=True,
+        instance_id="node1",
+        run_id="run_retry_calib",
+        estimator=fresh_estimator,
+    )
+    assert prof.samples == 1
+    assert prof.throughput == pytest.approx(fps_after_first)
+
+
+def test_cli_separate_history_and_profile_persistence_reporting(tmp_path, monkeypatch):
+    """Verify that CLI reports history persistence success separately from profile persistence,
+    so profile write failure does not mask durable history saving."""
+    from accelpack import cli
+    import io
+    import sys
+
+    history_file = tmp_path / "history.json"
+    inst_file = tmp_path / "inst.json"
+    jobs_file = tmp_path / "jobs.json"
+    record_file = tmp_path / "record.json"
+    bad_profiles_file = tmp_path / "nonexistent_dir" / "profiles.json"
+
+    inst_file.write_text(json.dumps([{"instance_id": "n1", "device_count": 1, "remaining_quota_h": 10.0}]))
+    jobs_file.write_text(json.dumps([{"job_id": "dummy", "duration_h": 1.0}]))
+    record_file.write_text(json.dumps({
+        "job_id": "job_prof_fail",
+        "run_id": "run_prof_fail_001",
+        "env_id": "cifar",
+        "model": "resnet",
+        "steps": 100000,
+        "predicted_duration_h": 1.0,
+        "actual_duration_h": 0.5,
+        "success": True,
+        "instance_id": "n1",
+    }))
+
+    from accelpack import cli as cli_mod
+    orig_atomic = cli_mod.atomic_save_json
+    def fail_profiles(path, data):
+        if "profiles" in str(path):
+            raise OSError("Disk quota exceeded on profiles volume")
+        return orig_atomic(path, data)
+    monkeypatch.setattr(cli_mod, "atomic_save_json", fail_profiles)
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "accelpack.cli",
+            "--instances", str(inst_file),
+            "--jobs", str(jobs_file),
+            "--history", str(history_file),
+            "--profiles", str(bad_profiles_file),
+            "--record-job", str(record_file),
+        ],
+    )
+
+    out = io.StringIO()
+    err = io.StringIO()
+    monkeypatch.setattr(sys, "stdout", out)
+    monkeypatch.setattr(sys, "stderr", err)
+    cli.main()
+
+    stdout_text = out.getvalue()
+    stderr_text = err.getvalue()
+
+    # History succeeded
+    assert "[OK] Recorded completed job job_prof_fail (run_id: run_prof_fail_001) into history." in stdout_text
+    # Profile failure reported explicitly without masking history success
+    assert "History record was saved, but failed to persist updated profiles" in stderr_text
+    assert "[OK] Persisted" not in stdout_text
+
+    # History file contains the record
+    reconciler = ExecutionReconciler(history_file=history_file)
+    assert len(reconciler.history) == 1
+    assert reconciler.history[0].run_id == "run_prof_fail_001"
+
+
+def test_account_remaining_quota_order_independent():
+    """Verify that ExecutionPlan.account_remaining_quota returns consistent canonical balances
+    regardless of instance order when instances declare conflicting quotas."""
+    inst_5 = Instance(instance_id="node_5", account_id="shared_pool", remaining_quota_h=5.0)
+    inst_20 = Instance(instance_id="node_20", account_id="shared_pool", remaining_quota_h=20.0)
+
+    j = Job(job_id="j1", duration_h=1.0)
+    slot_5 = DeviceSlot("node_5", 0, load_h=1.0, jobs=[j])
+    plan_5 = InstancePlan(instance=inst_5, slots=[slot_5], setup_overhead_h=0.0)
+    plan_20 = InstancePlan(instance=inst_20, slots=[DeviceSlot("node_20", 0)], setup_overhead_h=0.0)
+
+    # Order 1: node_5 first, node_20 second
+    plan_order1 = ExecutionPlan(instance_plans=[plan_5, plan_20])
+    rem1 = plan_order1.account_remaining_quota()
+
+    # Order 2: node_20 first, node_5 second
+    plan_order2 = ExecutionPlan(instance_plans=[plan_20, plan_5])
+    rem2 = plan_order2.account_remaining_quota()
+
+    # Both must resolve to the authoritative conservative minimum pool quota (5.0 - 1.0 = 4.0h)
+    assert rem1["shared_pool"] == pytest.approx(4.0)
+    assert rem2["shared_pool"] == pytest.approx(4.0)
+
 
 
 

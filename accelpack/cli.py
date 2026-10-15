@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import sys
 import uuid
 from pathlib import Path
@@ -12,7 +13,12 @@ from pathlib import Path
 from accelpack.estimator import ProfileDurationEstimator
 from accelpack.models import Instance, Job, ObjectiveMode, PackingStrategy
 from accelpack.preflight import PreflightValidator
-from accelpack.reconciliation import ExecutionReconciler, HistoryPersistenceException
+from accelpack.reconciliation import (
+    ExecutionReconciler,
+    HistoryPersistenceException,
+    ReplayResult,
+    atomic_save_json,
+)
 from accelpack.scheduler import AccelPackScheduler, QuotaExceededException
 
 
@@ -87,28 +93,43 @@ def main():
 
     # Step B: Replay unapplied historical execution records into estimator (if history provided)
     if reconciler and reconciler.history:
-        replayed = reconciler.replay_into_estimator(estimator)
-        if replayed > 0:
-            print(f"[OK] Replayed {replayed} unapplied historical execution records to calibrate throughput profiles.")
-            if args.profiles:
-                Path(args.profiles).write_text(json.dumps(estimator.to_dict_list(), indent=2), encoding="utf-8")
+        replay_res = reconciler.replay_into_estimator(estimator)
+        if replay_res.replayed_count > 0:
+            print(f"[OK] Replayed {replay_res.replayed_count} unapplied historical execution records to calibrate throughput profiles.")
+        if replay_res.migrations_count > 0:
+            print(f"[OK] Migrated {replay_res.migrations_count} legacy profile marker(s) to historical execution run IDs.")
+        if replay_res.modified and args.profiles:
+            try:
+                atomic_save_json(args.profiles, estimator.to_dict_list())
+            except Exception as e:
+                sys.stderr.write(f"[ERROR AccelPack] Failed to persist profiles database to {args.profiles}: {e}\n")
 
     # Record completed job if requested
     if args.record_job and Path(args.record_job).exists() and reconciler:
+        run_path = Path(args.record_job)
         try:
-            run_path = Path(args.record_job)
             run_data = json.loads(run_path.read_text(encoding="utf-8"))
+        except Exception as e:
+            sys.stderr.write(f"[ERROR AccelPack] Failed to read job record file {run_path}: {e}\n")
+            return
 
-            # Ensure a stable run_id exists; if missing, generate a UUID once and persist it back
-            if not run_data.get("run_id"):
-                jid = run_data.get("job_id", "job")
-                assigned_run_id = f"run_{jid}_{uuid.uuid4().hex[:12]}"
-                run_data["run_id"] = assigned_run_id
-                try:
-                    run_path.write_text(json.dumps(run_data, indent=2), encoding="utf-8")
-                except Exception:
-                    pass  # Non-fatal if input file is read-only
+        # Ensure a stable run_id exists; fail closed if generated run_id cannot be persisted
+        if not run_data.get("run_id"):
+            jid = run_data.get("job_id", "job")
+            assigned_run_id = f"run_{jid}_{uuid.uuid4().hex[:12]}"
+            run_data["run_id"] = assigned_run_id
+            try:
+                atomic_save_json(run_path, run_data)
+            except Exception as e:
+                sys.stderr.write(
+                    f"[ERROR AccelPack] Cannot persist generated run_id to {run_path}: {e}. "
+                    f"Aborting execution recording to prevent breaking idempotence.\n"
+                )
+                return
 
+        # Step 1: Record into history
+        history_persisted = False
+        try:
             reconciler.record_job(
                 job_id=run_data["job_id"],
                 env_id=run_data.get("env_id", ""),
@@ -127,14 +148,25 @@ def main():
                 cpu_busy_pct=run_data.get("cpu_busy_pct"),
                 estimator=estimator,
             )
-            print(f"[OK] Recorded completed job {run_data['job_id']} into history and calibrated profiles.")
-            if args.profiles:
-                Path(args.profiles).write_text(json.dumps(estimator.to_dict_list(), indent=2), encoding="utf-8")
-                print(f"[OK] Persisted {len(estimator.to_dict_list())} updated profiles to {args.profiles}")
+            history_persisted = True
+            print(f"[OK] Recorded completed job {run_data['job_id']} (run_id: {run_data['run_id']}) into history.")
         except HistoryPersistenceException as e:
             sys.stderr.write(f"[ERROR AccelPack] Failed to persist job execution history: {e}\n")
+            return
         except Exception as e:
             sys.stderr.write(f"[ERROR AccelPack] Failed to record job summary: {e}\n")
+            return
+
+        # Step 2: Persist updated profiles atomically if requested
+        if history_persisted and args.profiles:
+            try:
+                atomic_save_json(args.profiles, estimator.to_dict_list())
+                print(f"[OK] Persisted {len(estimator.to_dict_list())} updated profiles to {args.profiles}")
+            except Exception as e:
+                sys.stderr.write(
+                    f"[ERROR AccelPack] History record was saved, but failed to persist updated profiles to {args.profiles}: {e}. "
+                    f"Subsequent replay will recover profile calibrations from history.\n"
+                )
 
     # Print accuracy report if requested
     if args.accuracy_report:

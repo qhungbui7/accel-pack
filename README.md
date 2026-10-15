@@ -105,7 +105,7 @@ Total Billed Resource Time: 3.70 quota-hours
 Quota Productivity: 186.5% (1.86 worker-hours / billed quota-hour)
 Global Makespan: 3.70 hours
 ----------------------------------------------------------------------
-[node-01 (Account: node-01)] Makespan: 3.70h | Billed: 3.70h | Quota Remaining After: 20.30h | Workers: 2/2
+[node-01 (Account: node-01)] Makespan: 3.70h | Billed: 3.70h | Account Quota Remaining: 20.30h | Workers: 2/2
   CPU Demand: 2.0/4.0 cores (50%)
   ├── Device 0 (Wall-load: 3.60h, Peak VRAM: 0.60/16.0 GB):
   │     [Queue] train_model_s3 (1.80h), train_model_s1 (1.80h)
