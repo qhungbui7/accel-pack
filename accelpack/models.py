@@ -391,24 +391,31 @@ class ExecutionPlan:
             accts[acc_id] = accts.get(acc_id, 0.0) + ip.billed_resource_h
         return accts
 
-    def account_remaining_quota(self) -> Dict[str, float]:
-        """Aggregate remaining quota hours after all planned active instance debits, grouped by account_id.
-        Authoritative pool quota uses conservative minimum declared quota across all instances in that account,
-        eliminating list-order dependence for conflicting declarations.
+    def account_declared_quota(self) -> Dict[str, float]:
+        """Aggregate authoritative declared quota per account_id across all configured instances.
+        Uses conservative minimum declared quota across all instances in that account,
+        strictly eliminating list-order dependence for conflicting declarations.
         """
-        acct_billed = self.account_billed_quota()
-        acct_pools: Dict[str, float] = {}
+        pools: Dict[str, float] = {}
         for ip in self.instance_plans:
             acc_id = ip.instance.account_id or ip.instance.instance_id
             quota = ip.instance.remaining_quota_h
-            if acc_id not in acct_pools:
-                acct_pools[acc_id] = quota
+            if acc_id not in pools:
+                pools[acc_id] = quota
             else:
-                acct_pools[acc_id] = min(acct_pools[acc_id], quota)
+                pools[acc_id] = min(pools[acc_id], quota)
+        return pools
 
+    def account_remaining_quota(self) -> Dict[str, float]:
+        """Aggregate remaining quota hours after all planned active instance debits, grouped by account_id.
+        Authoritative pool quota uses conservative minimum declared quota across all instances in that account,
+        strictly eliminating list-order dependence for conflicting declarations.
+        """
+        acct_billed = self.account_billed_quota()
+        declared_pools = self.account_declared_quota()
         return {
             acc_id: max(0.0, pool_quota - acct_billed.get(acc_id, 0.0))
-            for acc_id, pool_quota in acct_pools.items()
+            for acc_id, pool_quota in declared_pools.items()
         }
 
     def summary(self) -> str:
@@ -430,11 +437,11 @@ class ExecutionPlan:
 
         # Account-level quota summary
         acct_billed = self.account_billed_quota()
+        declared_pools = self.account_declared_quota()
         if len(acct_billed) > 1 or any(ip.instance.account_id != ip.instance.instance_id for ip in self.instance_plans):
             lines.append("ACCOUNT QUOTA POOLS:")
             for acc_id, billed in acct_billed.items():
-                matching_insts = [ip.instance for ip in self.instance_plans if (ip.instance.account_id or ip.instance.instance_id) == acc_id]
-                pool_quota = matching_insts[0].remaining_quota_h if matching_insts else 0.0
+                pool_quota = declared_pools.get(acc_id, 0.0)
                 rem_after = max(0.0, pool_quota - billed)
                 lines.append(f"  * Account [{acc_id}]: Billed {billed:.2f}h | Remaining After {rem_after:.2f}h / {pool_quota:.2f}h")
             lines.append("-" * 70)

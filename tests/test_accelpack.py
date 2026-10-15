@@ -16,7 +16,12 @@ from accelpack.models import (
     PackingStrategy,
 )
 from accelpack.preflight import PreflightValidator
-from accelpack.reconciliation import ExecutionReconciler, HistoryPersistenceException
+from accelpack.reconciliation import (
+    ExecutionReconciler,
+    HistoryLoadException,
+    HistoryPersistenceException,
+    atomic_save_json,
+)
 from accelpack.scheduler import AccelPackScheduler, QuotaExceededException
 
 
@@ -1859,6 +1864,436 @@ def test_account_remaining_quota_order_independent():
     # Both must resolve to the authoritative conservative minimum pool quota (5.0 - 1.0 = 4.0h)
     assert rem1["shared_pool"] == pytest.approx(4.0)
     assert rem2["shared_pool"] == pytest.approx(4.0)
+
+
+def test_custom_run_id_lifecycle_and_exactly_once_calibration(tmp_path):
+    """Verify that custom arbitrary execution IDs (e.g. execution-123) survive profile registration,
+    serialization, reload, and replay without being misclassified, and calibrate the estimator exactly once."""
+    history_file = tmp_path / "history_custom.json"
+    profiles_file = tmp_path / "profiles_custom.json"
+
+    estimator = ProfileDurationEstimator()
+    estimator.register_profile(
+        env_id="cifar",
+        model="resnet",
+        fps=100.0,
+        samples=1,
+        confidence=0.70,
+    )
+
+    reconciler = ExecutionReconciler(history_file=history_file)
+    custom_run_id = "execution-123"
+
+    # 1. Record execution and update estimator (steps=360000, dur=0.5h -> measured_fps=200.0)
+    # EMA: (1 - 0.25)*100.0 + 0.25*200.0 = 125.0
+    rec1 = reconciler.record_job(
+        job_id="task_custom",
+        env_id="cifar",
+        model="resnet",
+        steps=360000,
+        predicted_duration_h=1.0,
+        actual_duration_h=0.5,
+        success=True,
+        instance_id="n1",
+        run_id=custom_run_id,
+        estimator=estimator,
+    )
+    assert len(reconciler.history) == 1
+    prof1 = estimator.get_profile(env_id="cifar", model="resnet")
+    assert custom_run_id in prof1.applied_run_ids
+    assert prof1.throughput == pytest.approx(125.0)
+    assert prof1.samples == 2
+
+    # 2. Submit the same execution again (retry)
+    reconciler.record_job(
+        job_id="task_custom",
+        env_id="cifar",
+        model="resnet",
+        steps=360000,
+        predicted_duration_h=1.0,
+        actual_duration_h=0.5,
+        success=True,
+        instance_id="n1",
+        run_id=custom_run_id,
+        estimator=estimator,
+    )
+    assert len(reconciler.history) == 1
+    prof2 = estimator.get_profile(env_id="cifar", model="resnet")
+    assert prof2.throughput == pytest.approx(125.0)
+    assert prof2.samples == 2
+
+    # 3. Save profile to JSON and reload into fresh estimator
+    atomic_save_json(profiles_file, estimator.to_dict_list())
+    estimator_reloaded = ProfileDurationEstimator()
+    prof_data = json.loads(profiles_file.read_text(encoding="utf-8"))
+    for p in prof_data:
+        estimator_reloaded.register_profile(
+            env_id=p["env_id"],
+            model=p["model"],
+            fps=p["fps"],
+            samples=p.get("samples", 1),
+            confidence=p.get("confidence", 1.0),
+            applied_run_ids=p.get("applied_run_ids"),
+            applied_job_ids=p.get("applied_job_ids"),
+            migrated_legacy_job_ids=p.get("migrated_legacy_job_ids"),
+        )
+    prof_reloaded = estimator_reloaded.get_profile(env_id="cifar", model="resnet")
+    assert custom_run_id in prof_reloaded.applied_run_ids
+    assert prof_reloaded.throughput == pytest.approx(125.0)
+    assert prof_reloaded.samples == 2
+
+    # 4. Replay execution history into restored estimator (must skip already-applied custom run_id)
+    reconciler_reloaded = ExecutionReconciler(history_file=history_file)
+    replay_res = reconciler_reloaded.replay_into_estimator(estimator_reloaded)
+    assert replay_res.replayed_count == 0
+    prof4 = estimator_reloaded.get_profile(env_id="cifar", model="resnet")
+    assert prof4.throughput == pytest.approx(125.0)
+    assert prof4.samples == 2
+
+    # 5. Submit the execution a third time with restored estimator
+    reconciler_reloaded.record_job(
+        job_id="task_custom",
+        env_id="cifar",
+        model="resnet",
+        steps=360000,
+        predicted_duration_h=1.0,
+        actual_duration_h=0.5,
+        success=True,
+        instance_id="n1",
+        run_id=custom_run_id,
+        estimator=estimator_reloaded,
+    )
+    assert len(reconciler_reloaded.history) == 1
+    prof5 = estimator_reloaded.get_profile(env_id="cifar", model="resnet")
+    assert prof5.throughput == pytest.approx(125.0)
+    assert prof5.samples == 2
+
+
+def _worker_assign_and_record(record_file, history_file, result_queue):
+    """Subprocess target for concurrent missing-ID assignment."""
+    from accelpack.cli import load_or_assign_execution_record
+    from accelpack.reconciliation import ExecutionReconciler
+
+    data = load_or_assign_execution_record(record_file)
+    reconciler = ExecutionReconciler(history_file=history_file)
+    rec = reconciler.record_job(
+        job_id=data["job_id"],
+        env_id=data.get("env_id", ""),
+        model=data.get("model", ""),
+        steps=data.get("steps", 0),
+        predicted_duration_h=data.get("predicted_duration_h", 0.0),
+        actual_duration_h=data.get("actual_duration_h", 0.0),
+        success=data.get("success", True),
+        instance_id=data.get("instance_id", ""),
+        run_id=data.get("run_id"),
+    )
+    result_queue.put((data["run_id"], rec.run_id))
+
+
+def test_concurrent_cli_processes_persist_same_input_run_id(tmp_path):
+    """Verify that two concurrent processes opening the same ID-less input file
+    both obtain the same canonical run_id and produce exactly one record in history."""
+    import multiprocessing
+
+    record_file = tmp_path / "shared_input.json"
+    history_file = tmp_path / "history_shared.json"
+
+    record_file.write_text(json.dumps({
+        "job_id": "concurrent_init_job",
+        "env_id": "cifar",
+        "model": "resnet",
+        "steps": 100000,
+        "predicted_duration_h": 1.0,
+        "actual_duration_h": 0.5,
+        "success": True,
+        "instance_id": "n1",
+    }))
+
+    ctx = multiprocessing.get_context("spawn")
+    q = ctx.Queue()
+
+    p1 = ctx.Process(target=_worker_assign_and_record, args=(str(record_file), str(history_file), q))
+    p2 = ctx.Process(target=_worker_assign_and_record, args=(str(record_file), str(history_file), q))
+
+    p1.start()
+    p2.start()
+    p1.join(timeout=10)
+    p2.join(timeout=10)
+
+    res1 = q.get(timeout=5)
+    res2 = q.get(timeout=5)
+
+    # Both processes must have read/assigned the exact same canonical run_id
+    assert res1[0] == res2[0]
+    assert res1[1] == res2[1]
+
+    # Input file has that canonical run_id persisted
+    persisted_input = json.loads(record_file.read_text(encoding="utf-8"))
+    assert persisted_input["run_id"] == res1[0]
+
+    # History contains exactly 1 execution record
+    reconciler = ExecutionReconciler(history_file=history_file)
+    assert len(reconciler.history) == 1
+    assert reconciler.history[0].run_id == res1[0]
+
+
+def test_process_terminates_after_id_persisted_resumes_cleanly(tmp_path):
+    """Verify that if a process persists a generated run_id and terminates before recording,
+    the next invocation reuses that durable ID and completes recording without generating a new ID."""
+    from accelpack.cli import load_or_assign_execution_record
+
+    record_file = tmp_path / "resume_record.json"
+    history_file = tmp_path / "history_resume.json"
+
+    record_file.write_text(json.dumps({
+        "job_id": "resume_job",
+        "env_id": "cifar",
+        "model": "resnet",
+        "steps": 100000,
+        "predicted_duration_h": 1.0,
+        "actual_duration_h": 0.5,
+        "success": True,
+        "instance_id": "n1",
+    }))
+
+    # Process 1: Assigns ID and persists, then terminates (simulated before record_job)
+    data1 = load_or_assign_execution_record(record_file)
+    assigned_id = data1["run_id"]
+    assert assigned_id.startswith("run_resume_job_")
+
+    # Verify input file has the ID persisted
+    saved_json = json.loads(record_file.read_text(encoding="utf-8"))
+    assert saved_json["run_id"] == assigned_id
+
+    # Process 2: Next invocation reads the same file and must reuse the persisted ID
+    data2 = load_or_assign_execution_record(record_file)
+    assert data2["run_id"] == assigned_id
+
+    reconciler = ExecutionReconciler(history_file=history_file)
+    reconciler.record_job(
+        job_id=data2["job_id"],
+        env_id=data2.get("env_id", ""),
+        model=data2.get("model", ""),
+        steps=data2.get("steps", 0),
+        predicted_duration_h=data2.get("predicted_duration_h", 0.0),
+        actual_duration_h=data2.get("actual_duration_h", 0.0),
+        success=data2.get("success", True),
+        instance_id=data2.get("instance_id", ""),
+        run_id=data2.get("run_id"),
+    )
+    assert len(reconciler.history) == 1
+    assert reconciler.history[0].run_id == assigned_id
+
+
+def test_history_load_failure_aborts_recording_preserves_original_file(tmp_path):
+    """Verify that corrupt or invalid history files fail closed with HistoryLoadException
+    and leave the original file byte-for-byte unchanged."""
+    history_file = tmp_path / "corrupt_history.json"
+
+    # Case A: Malformed raw JSON string
+    corrupt_bytes = b"{\n  'unquoted_key': True, invalid_json\n"
+    history_file.write_bytes(corrupt_bytes)
+
+    reconciler = ExecutionReconciler(history_file=history_file)
+    assert reconciler.load_error is not None
+
+    with pytest.raises(HistoryLoadException) as excinfo:
+        reconciler.record_job(
+            job_id="j1",
+            env_id="cifar",
+            model="resnet",
+            steps=1000,
+            predicted_duration_h=1.0,
+            actual_duration_h=1.0,
+            success=True,
+            instance_id="n1",
+        )
+    assert "failed to load existing history" in str(excinfo.value)
+    # File must be byte-for-byte unchanged
+    assert history_file.read_bytes() == corrupt_bytes
+
+    # Subsequent attempt also fails
+    with pytest.raises(HistoryLoadException):
+        reconciler.record_job(
+            job_id="j2",
+            env_id="cifar",
+            model="resnet",
+            steps=1000,
+            predicted_duration_h=1.0,
+            actual_duration_h=1.0,
+            success=True,
+            instance_id="n1",
+        )
+    assert history_file.read_bytes() == corrupt_bytes
+
+    # Case B: Structurally invalid JSON (JSON object where JSON list of records is expected)
+    struct_invalid_bytes = b'{"status": "ok", "error": "not a list"}'
+    history_file.write_bytes(struct_invalid_bytes)
+
+    reconciler2 = ExecutionReconciler(history_file=history_file)
+    assert reconciler2.load_error is not None
+    with pytest.raises(HistoryLoadException):
+        reconciler2.record_job(
+            job_id="j3",
+            env_id="cifar",
+            model="resnet",
+            steps=1000,
+            predicted_duration_h=1.0,
+            actual_duration_h=1.0,
+            success=True,
+            instance_id="n1",
+        )
+    assert history_file.read_bytes() == struct_invalid_bytes
+
+
+def _worker_record_and_calibrate(history_file, profiles_file, job_id, run_id, steps, actual_dur_h):
+    """Subprocess recording an execution and persisting calibrated profiles under profile lock."""
+    from accelpack.reconciliation import ExecutionReconciler, reconcile_and_persist_profiles
+    from accelpack.estimator import ProfileDurationEstimator
+
+    estimator = ProfileDurationEstimator()
+    reconciler = ExecutionReconciler(history_file=history_file)
+    reconciler.record_job(
+        job_id=job_id,
+        env_id="cifar",
+        model="resnet",
+        steps=steps,
+        predicted_duration_h=1.0,
+        actual_duration_h=actual_dur_h,
+        success=True,
+        instance_id="n1",
+        run_id=run_id,
+    )
+    reconcile_and_persist_profiles(profiles_file, reconciler, estimator)
+
+
+def test_concurrent_processes_profile_transaction_exact_ema(tmp_path):
+    """Verify that two independent concurrent processes recording distinct executions
+    and calibrating profiles produce an exact deterministic EMA throughput with zero lost updates."""
+    import multiprocessing
+
+    history_file = tmp_path / "history_concurrent.json"
+    profiles_file = tmp_path / "profiles_concurrent.json"
+
+    # Seed baseline profile: v0 = 100.0, samples = 1, confidence = 0.70
+    initial_estimator = ProfileDurationEstimator()
+    initial_estimator.register_profile(
+        env_id="cifar",
+        model="resnet",
+        fps=100.0,
+        samples=1,
+        confidence=0.70,
+    )
+    atomic_save_json(profiles_file, initial_estimator.to_dict_list())
+
+    # Process 1: steps=360000, dur=0.5h -> measured_fps=200.0
+    # Process 2: steps=540000, dur=0.5h -> measured_fps=300.0
+    ctx = multiprocessing.get_context("spawn")
+    p1 = ctx.Process(
+        target=_worker_record_and_calibrate,
+        args=(str(history_file), str(profiles_file), "job_a", "run_a", 360000, 0.5),
+    )
+    p2 = ctx.Process(
+        target=_worker_record_and_calibrate,
+        args=(str(history_file), str(profiles_file), "job_b", "run_b", 540000, 0.5),
+    )
+
+    p1.start()
+    p2.start()
+    p1.join(timeout=10)
+    p2.join(timeout=10)
+
+    # 1. History must contain both execution IDs
+    reconciler = ExecutionReconciler(history_file=history_file)
+    assert len(reconciler.history) == 2
+    history_run_ids = [r.run_id for r in reconciler.history]
+    assert "run_a" in history_run_ids
+    assert "run_b" in history_run_ids
+
+    # 2. Profiles must contain both IDs in applied_run_ids
+    final_estimator = ProfileDurationEstimator()
+    prof_data = json.loads(profiles_file.read_text(encoding="utf-8"))
+    for p in prof_data:
+        final_estimator.register_profile(
+            env_id=p["env_id"],
+            model=p["model"],
+            fps=p["fps"],
+            samples=p.get("samples", 1),
+            confidence=p.get("confidence", 1.0),
+            applied_run_ids=p.get("applied_run_ids"),
+            applied_job_ids=p.get("applied_job_ids"),
+            migrated_legacy_job_ids=p.get("migrated_legacy_job_ids"),
+        )
+    final_prof = final_estimator.get_profile(env_id="cifar", model="resnet")
+    assert "run_a" in final_prof.applied_run_ids
+    assert "run_b" in final_prof.applied_run_ids
+    assert final_prof.samples == 3
+
+    # 3. Exact EMA throughput verification based on the deterministic history order:
+    # If run_a was recorded first, history is [run_a, run_b]:
+    # v1 = (1 - 0.25)*100.0 + 0.25*200.0 = 125.0
+    # v2 = (1 - 0.25)*125.0 + 0.25*300.0 = 168.75
+    # If run_b was recorded first, history is [run_b, run_a]:
+    # v1 = (1 - 0.25)*100.0 + 0.25*300.0 = 150.0
+    # v2 = (1 - 0.25)*150.0 + 0.25*200.0 = 162.5
+    first_run = reconciler.history[0].run_id
+    expected_fps = 168.75 if first_run == "run_a" else 162.50
+    assert final_prof.throughput == pytest.approx(expected_fps, rel=1e-3)
+
+    # 4. A third replay leaves samples and throughput unchanged
+    replay_res3 = reconciler.replay_into_estimator(final_estimator)
+    assert replay_res3.replayed_count == 0
+    prof_after3 = final_estimator.get_profile(env_id="cifar", model="resnet")
+    assert prof_after3.samples == 3
+    assert prof_after3.throughput == pytest.approx(expected_fps, rel=1e-3)
+
+
+def test_account_declared_quota_consistent_and_order_independent():
+    """Verify that account_declared_quota provides a unified canonical pool quota,
+    matching summary() headers and instance rows regardless of input instance ordering,
+    and clamping remaining quota cleanly to 0.0 when billed time exceeds the declared pool."""
+    inst_5 = Instance(instance_id="node_5", account_id="shared_pool", remaining_quota_h=5.0)
+    inst_20 = Instance(instance_id="node_20", account_id="shared_pool", remaining_quota_h=20.0)
+
+    j = Job(job_id="j1", duration_h=1.0)
+    slot_5 = DeviceSlot("node_5", 0, load_h=1.0, jobs=[j])
+    plan_5 = InstancePlan(instance=inst_5, slots=[slot_5], setup_overhead_h=0.0)
+    plan_20 = InstancePlan(instance=inst_20, slots=[DeviceSlot("node_20", 0)], setup_overhead_h=0.0)
+
+    # Order 1: 5h instance first, 20h instance second
+    plan1 = ExecutionPlan(instance_plans=[plan_5, plan_20])
+    declared1 = plan1.account_declared_quota()
+    remaining1 = plan1.account_remaining_quota()
+    sum1 = plan1.summary()
+
+    # Order 2: 20h instance first, 5h instance second
+    plan2 = ExecutionPlan(instance_plans=[plan_20, plan_5])
+    declared2 = plan2.account_declared_quota()
+    remaining2 = plan2.account_remaining_quota()
+    sum2 = plan2.summary()
+
+    # Canonical declared quota is 5.0h in both orders
+    assert declared1["shared_pool"] == 5.0
+    assert declared2["shared_pool"] == 5.0
+
+    # Remaining quota is 4.0h in both orders
+    assert remaining1["shared_pool"] == 4.0
+    assert remaining2["shared_pool"] == 4.0
+
+    # Pool header in summary displays 4.00h / 5.00h in both orders
+    assert "Remaining After 4.00h / 5.00h" in sum1
+    assert "Remaining After 4.00h / 5.00h" in sum2
+
+    # Case 3: Planned debit exceeds declared quota
+    j_over = Job(job_id="j_over", duration_h=7.0)
+    slot_over = DeviceSlot("node_5", 0, load_h=7.0, jobs=[j_over])
+    plan_over = InstancePlan(instance=inst_5, slots=[slot_over], setup_overhead_h=0.0)
+    plan_exceeded = ExecutionPlan(instance_plans=[plan_over, plan_20])
+
+    assert plan_exceeded.account_declared_quota()["shared_pool"] == 5.0
+    assert plan_exceeded.account_remaining_quota()["shared_pool"] == 0.0
+    sum_exceeded = plan_exceeded.summary()
+    assert "Remaining After 0.00h / 5.00h" in sum_exceeded
 
 
 

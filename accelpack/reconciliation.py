@@ -8,7 +8,12 @@ running separate diagnostic benchmark sessions.
 from __future__ import annotations
 
 import contextlib
-import fcntl
+try:
+    import fcntl
+    HAS_FCNTL = True
+except ImportError:
+    fcntl = None  # type: ignore
+    HAS_FCNTL = False
 import hashlib
 import json
 import math
@@ -26,6 +31,43 @@ from accelpack.estimator import ProfileDurationEstimator
 class HistoryPersistenceException(Exception):
     """Raised when writing execution history to persistent storage fails."""
     pass
+
+
+class HistoryLoadException(Exception):
+    """Raised when reading or parsing execution history from persistent storage fails."""
+    pass
+
+
+@contextlib.contextmanager
+def file_lock(lock_target_path: Optional[Path | str]):
+    """Cross-process advisory lock using fcntl.flock on a sibling .lock file.
+    Provides robust exclusion on POSIX systems (Linux, macOS). On platforms where fcntl
+    is unavailable (e.g. native Windows) or when permissions prevent lock file creation,
+    provides a graceful fallback.
+    """
+    if not lock_target_path:
+        yield
+        return
+
+    path = Path(lock_target_path)
+    lock_path = path.with_name(f"{path.name}.lock")
+    fd = None
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        if HAS_FCNTL and fcntl is not None:
+            fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR)
+            fcntl.flock(fd, fcntl.LOCK_EX)
+    except (PermissionError, OSError):
+        fd = None
+
+    try:
+        yield
+    finally:
+        if fd is not None:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
 
 
 def atomic_save_json(target_path: Path | str, data: Any) -> None:
@@ -112,8 +154,13 @@ class ExecutionReconciler:
     def _load_history(self):
         if self.history_file and self.history_file.exists():
             try:
-                data = json.loads(self.history_file.read_text(encoding="utf-8"))
+                content = self.history_file.read_text(encoding="utf-8")
+                data = json.loads(content)
+                if not isinstance(data, list):
+                    raise ValueError(f"History file {self.history_file} must contain a JSON array, got {type(data).__name__}")
                 for idx, r in enumerate(data):
+                    if not isinstance(r, dict):
+                        raise ValueError(f"Record at index {idx} in {self.history_file} is not a valid JSON object")
                     if "run_id" not in r or not r["run_id"]:
                         jid = r.get("job_id", "job")
                         ts = r.get("timestamp", str(idx))
@@ -129,39 +176,22 @@ class ExecutionReconciler:
 
     def _file_lock(self):
         """Cross-process advisory lock to serialize read, duplicate check, append, and persistence."""
-        if not self.history_file:
-            @contextlib.contextmanager
-            def _noop():
-                yield
-            return _noop()
-
-        lock_path = self.history_file.with_name(f"{self.history_file.name}.lock")
-        try:
-            lock_path.parent.mkdir(parents=True, exist_ok=True)
-        except Exception:
-            pass
-        fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR)
-        @contextlib.contextmanager
-        def _flock():
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX)
-                yield
-            finally:
-                try:
-                    fcntl.flock(fd, fcntl.LOCK_UN)
-                finally:
-                    os.close(fd)
-        return _flock()
+        return file_lock(self.history_file)
 
     def _reload_history_unlocked(self):
         """Reloads latest history from disk under active lock to avoid stale snapshots,
         preserving object identity for existing in-memory records."""
         if self.history_file and self.history_file.exists():
             try:
-                data = json.loads(self.history_file.read_text(encoding="utf-8"))
+                content = self.history_file.read_text(encoding="utf-8")
+                data = json.loads(content)
+                if not isinstance(data, list):
+                    raise ValueError(f"History file {self.history_file} must contain a JSON array, got {type(data).__name__}")
                 existing_by_run_id = {r.run_id: r for r in self.history}
                 recs = []
                 for idx, r in enumerate(data):
+                    if not isinstance(r, dict):
+                        raise ValueError(f"Record at index {idx} in {self.history_file} is not a valid JSON object")
                     rid = r.get("run_id")
                     if not rid:
                         jid = r.get("job_id", "job")
@@ -233,6 +263,8 @@ class ExecutionReconciler:
         with self._file_lock():
             # 1. Reload latest state under lock to prevent lost updates from concurrent writers
             self._reload_history_unlocked()
+            if self.load_error is not None:
+                raise HistoryLoadException(f"Cannot record job: failed to load existing history from {self.history_file}: {self.load_error}")
 
             # 2. Check if already recorded in self.history (idempotent submission by run_id)
             existing_rec: Optional[JobExecutionRecord] = None
@@ -412,16 +444,20 @@ class ExecutionReconciler:
         Thereafter, deduplication is performed exclusively by execution run_id so subsequent
         runs of the same logical job are never silently suppressed.
         """
+        if self.load_error is not None:
+            raise HistoryLoadException(f"Cannot replay into estimator: failed to load history from {self.history_file}: {self.load_error}")
+
         migrations_count = 0
         # Step 1: Explicit one-time migration of legacy profile markers
         for key, profile in estimator._profiles.items():
             if profile.legacy_job_ids:
                 env_k, model_k, hw_k, workers_k = key
                 unmigrated = list(profile.legacy_job_ids)
-                for legacy_jid in unmigrated:
-                    matching_runs = [
+                for legacy_marker in unmigrated:
+                    # Check 1: Does legacy_marker match a historical run_id directly?
+                    matching_by_run_id = [
                         r for r in self.history
-                        if r.job_id == legacy_jid
+                        if r.run_id == legacy_marker
                         and r.env_id.strip().lower() == env_k
                         and r.model.strip().lower() == model_k
                         and r.hardware_class.strip().lower() == hw_k
@@ -429,25 +465,42 @@ class ExecutionReconciler:
                         and r.success
                         and r.measured_fps and r.measured_fps > 0
                     ]
-                    if matching_runs:
-                        earliest = matching_runs[0]
+                    # Check 2: Does legacy_marker match a historical job_id?
+                    matching_by_job_id = [
+                        r for r in self.history
+                        if r.job_id == legacy_marker
+                        and r.env_id.strip().lower() == env_k
+                        and r.model.strip().lower() == model_k
+                        and r.hardware_class.strip().lower() == hw_k
+                        and r.concurrent_workers_on_device == workers_k
+                        and r.success
+                        and r.measured_fps and r.measured_fps > 0
+                    ]
+
+                    if matching_by_run_id:
+                        run_rec = matching_by_run_id[0]
+                        if run_rec.run_id not in profile.applied_run_ids:
+                            profile.applied_run_ids.append(run_rec.run_id)
+                        migrations_count += 1
+                    elif matching_by_job_id:
+                        earliest = matching_by_job_id[0]
                         if earliest.run_id not in profile.applied_run_ids:
                             profile.applied_run_ids.append(earliest.run_id)
-                        if legacy_jid not in profile.migrated_legacy_job_ids:
-                            profile.migrated_legacy_job_ids.append(legacy_jid)
+                        if legacy_marker not in profile.migrated_legacy_job_ids:
+                            profile.migrated_legacy_job_ids.append(legacy_marker)
                         migrations_count += 1
-                        if len(matching_runs) > 1:
+                        if len(matching_by_job_id) > 1:
                             sys.stderr.write(
                                 f"[WARN AccelPack] Legacy profile for {env_k}/{model_k} (workers={workers_k}) has "
-                                f"unmigrated marker '{legacy_jid}'. Associated legacy calibration with run '{earliest.run_id}'. "
-                                f"Subsequent {len(matching_runs) - 1} execution(s) will be replayed.\n"
+                                f"unmigrated marker '{legacy_marker}'. Associated legacy calibration with run '{earliest.run_id}'. "
+                                f"Subsequent {len(matching_by_job_id) - 1} execution(s) will be replayed.\n"
                             )
                     else:
-                        if legacy_jid not in profile.migrated_legacy_job_ids:
-                            profile.migrated_legacy_job_ids.append(legacy_jid)
+                        if legacy_marker not in profile.migrated_legacy_job_ids:
+                            profile.migrated_legacy_job_ids.append(legacy_marker)
                         migrations_count += 1
                         sys.stderr.write(
-                            f"[WARN AccelPack] Legacy profile marker for job '{legacy_jid}' has no matching historical runs.\n"
+                            f"[WARN AccelPack] Legacy profile marker for job '{legacy_marker}' has no matching historical runs.\n"
                         )
                 # Clear legacy markers after migration so deduplication is strictly by run_id
                 profile.legacy_job_ids = []
@@ -496,4 +549,56 @@ class ExecutionReconciler:
                 )
                 count += 1
         return ReplayResult(count, migrations_count)
+
+
+def reconcile_and_persist_profiles(
+    profiles_path: Path | str,
+    reconciler: ExecutionReconciler,
+    estimator: ProfileDurationEstimator,
+    save_fn: Any = atomic_save_json,
+) -> ReplayResult:
+    """Full read-modify-write transactional coordinator for estimator profiles.
+    Serializes profile reload, fresh history replay, and atomic persistence under a profile lock,
+    guaranteeing that concurrent CLI processes cannot overwrite or lose telemetry updates.
+    """
+    path = Path(profiles_path)
+    with file_lock(path):
+        # 1. Reload latest persisted profiles from disk under profile lock
+        if path.exists():
+            try:
+                prof_data = json.loads(path.read_text(encoding="utf-8"))
+                for p in prof_data:
+                    estimator.register_profile(
+                        env_id=p["env_id"],
+                        model=p["model"],
+                        fps=p["fps"],
+                        vram_gb=p.get("vram_gb", 0.5),
+                        ram_gb=p.get("ram_gb", 1.5),
+                        cpu_cores=p.get("cpu_cores", 1.0),
+                        hardware_class=p.get("hardware_class", "nvidia_t4"),
+                        workers_per_device=p.get("workers_per_device", 1),
+                        samples=p.get("samples", 1),
+                        confidence=p.get("confidence", 1.0),
+                        applied_run_ids=p.get("applied_run_ids"),
+                        applied_job_ids=p.get("applied_job_ids"),
+                        migrated_legacy_job_ids=p.get("migrated_legacy_job_ids"),
+                        legacy_job_ids=p.get("legacy_job_ids"),
+                        schema_version=p.get("schema_version"),
+                    )
+            except Exception as e:
+                sys.stderr.write(f"[WARN AccelPack] Could not reload latest profiles database {path}: {e}\n")
+
+        # 2. Obtain fresh snapshot of execution history under history lock (lock released immediately)
+        with reconciler._file_lock():
+            reconciler._reload_history_unlocked()
+            if reconciler.load_error is not None:
+                raise HistoryLoadException(reconciler.load_error)
+
+        # 3. Replay all unapplied historical executions into estimator in deterministic order
+        replay_res = reconciler.replay_into_estimator(estimator)
+
+        # 4. Atomically persist updated profiles
+        save_fn(path, estimator.to_dict_list())
+
+        return replay_res
 

@@ -78,48 +78,37 @@ class ProfileDurationEstimator:
         applied_run_ids: Optional[List[str]] = None,
         applied_job_ids: Optional[List[str]] = None,
         migrated_legacy_job_ids: Optional[List[str]] = None,
+        legacy_job_ids: Optional[List[str]] = None,
+        schema_version: Optional[int] = None,
     ) -> None:
-        """Registers empirical execution profile isolated by hardware class and concurrency level."""
+        """Registers empirical execution profile isolated by hardware class and concurrency level.
+        Execution IDs in applied_run_ids are preserved as authoritative execution identities
+        without string-pattern heuristics. Legacy job markers from applied_job_ids or legacy_job_ids
+        are tracked separately for one-time historical migration.
+        """
         if fps <= 0:
             raise ValueError(f"FPS must be positive, got {fps}")
         key = self._normalize_key(env_id, model, hardware_class, workers_per_device)
-        applied_runs = list(applied_run_ids or [])
-        legacy_jobs = list(applied_job_ids or [])
-        already_migrated = list(migrated_legacy_job_ids or [])
 
-        clean_run_ids: List[str] = []
-        clean_legacy_ids: List[str] = []
-        clean_migrated_ids: List[str] = []
+        # 1. applied_run_ids is authoritative: every entry is an execution ID
+        clean_run_ids: List[str] = list(dict.fromkeys(applied_run_ids or []))
 
-        for item in applied_runs:
-            if is_execution_run_id(item):
-                if item not in clean_run_ids:
-                    clean_run_ids.append(item)
-            elif item in already_migrated:
-                if item not in clean_migrated_ids:
-                    clean_migrated_ids.append(item)
-            else:
-                if item not in clean_legacy_ids:
-                    clean_legacy_ids.append(item)
+        # 2. migrated_legacy_job_ids records legacy markers already converted
+        clean_migrated_ids: List[str] = list(dict.fromkeys(migrated_legacy_job_ids or []))
 
-        for item in legacy_jobs:
-            if is_execution_run_id(item):
-                if item not in clean_run_ids:
-                    clean_run_ids.append(item)
-            elif item in already_migrated:
-                if item not in clean_migrated_ids:
-                    clean_migrated_ids.append(item)
-            else:
-                if item not in clean_legacy_ids:
-                    clean_legacy_ids.append(item)
+        # 3. legacy job markers come from legacy_job_ids or deprecated applied_job_ids
+        raw_legacy = list(dict.fromkeys(legacy_job_ids or []))
+        if applied_job_ids:
+            for item in applied_job_ids:
+                if item not in clean_run_ids and item not in clean_migrated_ids and item not in raw_legacy:
+                    raw_legacy.append(item)
 
-        for item in already_migrated:
-            if item not in clean_migrated_ids:
-                clean_migrated_ids.append(item)
-            if item in clean_legacy_ids:
-                clean_legacy_ids.remove(item)
+        clean_legacy_ids: List[str] = [
+            item for item in raw_legacy
+            if item not in clean_run_ids and item not in clean_migrated_ids
+        ]
 
-        # If any legacy job id already has a corresponding run in clean_run_ids, it is already migrated
+        # If any legacy job id already has a corresponding run in clean_run_ids, mark as migrated
         for leg_id in list(clean_legacy_ids):
             if any(rid.startswith(f"legacy_{leg_id}_") or rid == leg_id for rid in clean_run_ids):
                 clean_legacy_ids.remove(leg_id)
@@ -252,6 +241,7 @@ class ProfileDurationEstimator:
         result = []
         for (env_id, model, hw, workers), rec in self._profiles.items():
             result.append({
+                "schema_version": 2,
                 "env_id": env_id,
                 "model": model,
                 "fps": rec.throughput,
