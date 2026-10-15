@@ -45,12 +45,13 @@ class TestAccelPack(unittest.TestCase):
         self.assertFalse(rep.passed)
         self.assertTrue(any(i.code == "JOB_EXCEEDS_SESSION_LIMIT" for i in rep.blockers))
 
-        # 2. Resumable job passes preflight and is schedulable
+        # 2. Resumable job passes preflight and is schedulable across multi-session fleet
         job_resumable = Job(job_id="huge_resumable", duration_h=12.0, resumable=True, segments=[6.0, 6.0])
         rep = validator.validate([job_resumable], [inst_good])
         self.assertTrue(rep.passed)
+        inst_good2 = Instance(instance_id="node-good2", device_count=2, remaining_quota_h=25.0, max_session_h=11.0)
         sched = AccelPackScheduler(expand_segments=True)
-        plan = sched.schedule([job_resumable], [inst_good])
+        plan = sched.schedule([job_resumable], [inst_good, inst_good2])
         self.assertEqual(len(plan.unassigned_jobs), 0)
         scheduled_ids = [j.job_id for ip in plan.active_instances for s in ip.slots for j in s.jobs]
         self.assertIn("huge_resumable_seg0", scheduled_ids)

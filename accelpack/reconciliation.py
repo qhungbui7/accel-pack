@@ -248,3 +248,38 @@ class ExecutionReconciler:
             },
             "by_stratum": strata_report,
         }
+
+    def replay_into_estimator(self, estimator: ProfileDurationEstimator) -> int:
+        """Replays all successful historical job executions to calibrate estimator profiles."""
+        count = 0
+        for rec in self.history:
+            if rec.success and rec.measured_fps and rec.measured_fps > 0:
+                existing = estimator.get_profile(
+                    env_id=rec.env_id,
+                    model=rec.model,
+                    hardware_class=rec.hardware_class,
+                    workers_per_device=rec.concurrent_workers_on_device,
+                )
+                prior_fps = existing.throughput if existing else (estimator.default_fps / (1.0 + 0.3 * (rec.concurrent_workers_on_device - 1)))
+                new_fps = (1.0 - self.learning_rate) * prior_fps + self.learning_rate * rec.measured_fps
+                new_samples = (existing.samples + 1) if existing else 1
+                new_conf = min(0.95, (existing.confidence + 0.05) if existing else 0.70)
+                new_vram = max(existing.vram_gb, rec.peak_vram_gb or 0.5) if existing else (rec.peak_vram_gb or 0.5)
+                new_ram = max(existing.ram_gb, rec.peak_ram_gb or 1.5) if existing else (rec.peak_ram_gb or 1.5)
+                new_cpu = existing.cpu_cores if existing else 1.0
+
+                estimator.register_profile(
+                    env_id=rec.env_id,
+                    model=rec.model,
+                    fps=new_fps,
+                    vram_gb=new_vram,
+                    ram_gb=new_ram,
+                    cpu_cores=new_cpu,
+                    hardware_class=rec.hardware_class,
+                    workers_per_device=rec.concurrent_workers_on_device,
+                    samples=new_samples,
+                    confidence=new_conf,
+                )
+                count += 1
+        return count
+

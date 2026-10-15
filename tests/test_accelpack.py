@@ -449,3 +449,139 @@ def test_gang_scheduling_unsupported():
     with pytest.raises(NotImplementedError):
         Job(job_id="gang_job", duration_h=1.0, device_count=2)
 
+
+def test_session_limit_includes_setup_overhead_rejection():
+    """Verify that jobs whose duration + setup overhead exceeds session limit are rejected."""
+    # Instance max session is 1.0 hour, setup overhead is 0.10h.
+    # Job duration is 0.95h.
+    # 0.95h + 0.10h = 1.05h > 1.00h session limit -> Must be rejected!
+    inst = [Instance(instance_id="n1", max_session_h=1.0, remaining_quota_h=20.0)]
+    job = [Job(job_id="j_tight", duration_h=0.95)]
+
+    # BALANCE strategy
+    sched_bal = AccelPackScheduler(strategy=PackingStrategy.BALANCE, setup_overhead_h=0.10)
+    with pytest.raises(QuotaExceededException):
+        sched_bal.schedule(job, inst, allow_partial=False)
+
+    # CONCENTRATE strategy
+    sched_conc = AccelPackScheduler(strategy=PackingStrategy.CONCENTRATE, setup_overhead_h=0.10)
+    with pytest.raises(QuotaExceededException):
+        sched_conc.schedule(job, inst, allow_partial=False)
+
+
+def test_json_concurrency_slowdown_string_keys_normalized():
+    """Verify that concurrency slowdown factor dictionaries with string keys (from JSON) are normalized to int."""
+    json_factors = {"1": 1.0, "2": 1.35, "3": 1.70}
+    inst = Instance(instance_id="n1", concurrency_slowdown_factors=json_factors)
+
+    # Must convert string keys to int
+    assert 1 in inst.concurrency_slowdown_factors
+    assert 2 in inst.concurrency_slowdown_factors
+    assert inst.get_concurrency_slowdown(2) == 1.35
+    assert inst.get_concurrency_slowdown(4) > 1.70  # Fallback calculation works without TypeError
+
+
+def test_segmented_jobs_strict_ordering_and_sequential_slot_binding():
+    """Verify that segmented jobs are topologically ordered and assigned sequentially in the same slot."""
+    # Instance has 2 devices with 1 slot each. Session limit is 10.0h.
+    # Job has two segments: seg0 (4.0h) and seg1 (5.0h).
+    # If scheduled in parallel across device 0 and device 1, seg1 would start at t=0 concurrently with seg0.
+    # The dependency satisfaction rule requires seg1 to be placed in the SAME slot as seg0 (4.0h + 5.0h = 9.0h <= 10.0h).
+    instances = [Instance(instance_id="node1", device_count=2, max_session_h=10.0, remaining_quota_h=25.0)]
+    job = Job(job_id="resumable_task", duration_h=9.0, resumable=True, segments=[4.0, 5.0])
+
+    sched = AccelPackScheduler(expand_segments=True)
+    plan = sched.schedule([job], instances)
+
+    assert len(plan.active_instances) == 1
+    ip = plan.active_instances[0]
+
+    # Find which slot has seg0 and seg1
+    slot_with_seg0 = next(s for s in ip.slots if any(j.job_id == "resumable_task_seg0" for j in s.jobs))
+    slot_with_seg1 = next(s for s in ip.slots if any(j.job_id == "resumable_task_seg1" for j in s.jobs))
+
+    # They MUST be assigned to the same slot
+    assert slot_with_seg0 is slot_with_seg1
+    # seg0 must appear BEFORE seg1 in the sequential queue
+    job_ids = [j.job_id for j in slot_with_seg0.jobs]
+    assert job_ids.index("resumable_task_seg0") < job_ids.index("resumable_task_seg1")
+
+
+def test_closed_loop_telemetry_persists_profiles_and_modifies_schedule(tmp_path, monkeypatch):
+    """Verify that recording a job execution persists calibrated profiles, which subsequently update scheduling."""
+    from accelpack import cli
+
+    profiles_file = tmp_path / "profiles.json"
+    history_file = tmp_path / "history.json"
+    inst_file = tmp_path / "inst.json"
+    jobs_file = tmp_path / "jobs.json"
+    out_file = tmp_path / "out.json"
+
+    # Initial profile: CartPole MLP has 100 FPS (720,000 steps = 2.0h)
+    initial_profiles = [
+        {"env_id": "cartpole", "model": "mlp", "fps": 100.0, "hardware_class": "nvidia_t4", "workers_per_device": 1}
+    ]
+    profiles_file.write_text(json.dumps(initial_profiles), encoding="utf-8")
+
+    # Record run that actually completed twice as fast (200 FPS, 1.0h)
+    job_run = {
+        "job_id": "prev_run",
+        "env_id": "cartpole",
+        "model": "mlp",
+        "steps": 720000,
+        "predicted_duration_h": 2.0,
+        "actual_duration_h": 1.0,
+        "success": True,
+        "instance_id": "node_prev",
+        "hardware_class": "nvidia_t4",
+        "concurrent_workers": 1,
+    }
+    record_file = tmp_path / "run.json"
+    record_file.write_text(json.dumps(job_run), encoding="utf-8")
+
+    inst_file.write_text(json.dumps([{"instance_id": "n1", "device_count": 1, "remaining_quota_h": 10.0}]))
+    jobs_file.write_text(json.dumps([
+        {"job_id": "new_job", "duration_h": 2.0, "metadata": {"env": "cartpole", "model": "mlp", "steps": 720000}}
+    ]))
+
+    # Step 1: Run CLI with --record-job and --profiles
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "accelpack.cli",
+            "--instances", str(inst_file),
+            "--jobs", str(jobs_file),
+            "--history", str(history_file),
+            "--profiles", str(profiles_file),
+            "--record-job", str(record_file),
+            "--output", str(out_file),
+        ],
+    )
+    cli.main()
+
+    # Verify profiles file was updated and persisted
+    saved_profiles = json.loads(profiles_file.read_text(encoding="utf-8"))
+    assert len(saved_profiles) >= 1
+    # Moving average: (1 - 0.25)*100 + 0.25*200 = 125 FPS
+    updated_prof = next(p for p in saved_profiles if p["env_id"] == "cartpole")
+    assert updated_prof["fps"] == pytest.approx(125.0)
+
+    # Step 2: Run CLI with --reestimate, proving updated profiles modify scheduled duration
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "accelpack.cli",
+            "--instances", str(inst_file),
+            "--jobs", str(jobs_file),
+            "--profiles", str(profiles_file),
+            "--reestimate",
+            "--output", str(out_file),
+        ],
+    )
+    cli.main()
+
+    plan_data = json.loads(out_file.read_text(encoding="utf-8"))
+    # Re-estimated duration: 720,000 / (125 * 3600) = 1.60h (reduced from initial 2.0h!)
+    assert plan_data["total_work_h"] == pytest.approx(1.60, rel=1e-2)
+
+

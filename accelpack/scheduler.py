@@ -102,7 +102,7 @@ class AccelPackScheduler:
         return normalized
 
     def _expand_segmented_jobs(self, jobs: List[Job]) -> List[Job]:
-        """Expands jobs with checkpoint segments into schedulable discrete segment units."""
+        """Expands jobs with checkpoint segments into schedulable discrete segment units with explicit dependencies."""
         if not self.expand_segments:
             return jobs
 
@@ -110,6 +110,7 @@ class AccelPackScheduler:
         for j in jobs:
             if j.segments and len(j.segments) > 0:
                 for idx, seg_dur in enumerate(j.segments):
+                    prev_id = f"{j.job_id}_seg{idx - 1}" if idx > 0 else None
                     seg_job = Job(
                         job_id=f"{j.job_id}_seg{idx}",
                         duration_h=seg_dur,
@@ -119,17 +120,93 @@ class AccelPackScheduler:
                         priority=j.priority,
                         hardware_class=j.hardware_class,
                         resumable=j.resumable,
+                        depends_on=prev_id,
+                        parent_job_id=j.job_id,
+                        segment_index=idx,
                         metadata={
                             **j.metadata,
                             "parent_job_id": j.job_id,
                             "segment_index": idx,
                             "total_segments": len(j.segments),
+                            "depends_on": prev_id,
                         },
                     )
                     expanded.append(seg_job)
             else:
                 expanded.append(j)
         return expanded
+
+    def _order_jobs(self, jobs: List[Job]) -> List[Job]:
+        """Orders jobs preserving prerequisite dependencies (depends_on) while applying
+        objective-specific sorting among ready jobs."""
+        if self.objective == ObjectiveMode.MAXIMIZE_WORK:
+            key_fn = lambda j: (j.priority * j.duration_h, j.priority, -j.duration_h, j.job_id)
+        else:
+            key_fn = lambda j: (j.duration_h, j.priority, j.job_id)
+
+        job_map = {j.job_id: j for j in jobs}
+        in_degree: Dict[str, int] = {j.job_id: 0 for j in jobs}
+        dependents: Dict[str, List[Job]] = {j.job_id: [] for j in jobs}
+
+        for j in jobs:
+            if j.depends_on and j.depends_on in job_map:
+                in_degree[j.job_id] += 1
+                dependents[j.depends_on].append(j)
+
+        ready = [j for j in jobs if in_degree[j.job_id] == 0]
+        ordered: List[Job] = []
+
+        while ready:
+            ready.sort(key=key_fn, reverse=True)
+            chosen = ready.pop(0)
+            ordered.append(chosen)
+
+            for dep in dependents[chosen.job_id]:
+                in_degree[dep.job_id] -= 1
+                if in_degree[dep.job_id] == 0:
+                    ready.append(dep)
+
+        if len(ordered) < len(jobs):
+            for j in jobs:
+                if j not in ordered:
+                    ordered.append(j)
+
+        return ordered
+
+    def _check_dependency_satisfaction(
+        self,
+        job: Job,
+        candidate_ip: InstancePlan,
+        candidate_slot: DeviceSlot,
+        all_plans: List[InstancePlan],
+    ) -> bool:
+        """Ensures checkpoint dependencies are satisfied:
+        1. If job has depends_on, that prerequisite job must already be assigned in the plan.
+        2. If prerequisite is on the same instance, it MUST be in the same slot (running sequentially before this job).
+           (Different slots on the same node execute concurrently from container boot, violating checkpoint causality).
+        3. If prerequisite is on a different instance, the cross-instance/session dependency is preserved.
+        """
+        if not job.depends_on:
+            return True
+
+        prereq_ip: Optional[InstancePlan] = None
+        prereq_slot: Optional[DeviceSlot] = None
+        for ip in all_plans:
+            for s in ip.slots:
+                if any(j.job_id == job.depends_on for j in s.jobs):
+                    prereq_ip = ip
+                    prereq_slot = s
+                    break
+            if prereq_ip is not None:
+                break
+
+        if prereq_ip is None or prereq_slot is None:
+            return False
+
+        if prereq_ip.instance.instance_id == candidate_ip.instance.instance_id:
+            return prereq_slot is candidate_slot
+
+        return True
 
     def schedule(
         self,
@@ -157,29 +234,8 @@ class AccelPackScheduler:
         # 2. Expand segmented jobs if enabled
         schedulable_jobs = self._expand_segmented_jobs(jobs)
 
-        # 3. Sort jobs based on objective with deterministic tie-breaking
-        if self.objective == ObjectiveMode.MAXIMIZE_WORK:
-            # Sort by priority-weighted duration descending (knapsack density preference)
-            sorted_jobs = sorted(
-                schedulable_jobs,
-                key=lambda j: (j.priority * j.duration_h, j.priority, -j.duration_h, j.job_id),
-                reverse=True,
-            )
-        elif self.objective == ObjectiveMode.MAXIMIZE_EFFICIENCY:
-            # Longest processing jobs first to allow dense slot packing
-            sorted_jobs = sorted(
-                schedulable_jobs,
-                key=lambda j: (j.duration_h, j.priority, j.job_id),
-                reverse=True,
-            )
-        else:
-            # COMPLETE_ALL: Longest Processing Time First (LPT)
-            sorted_jobs = sorted(
-                schedulable_jobs,
-                key=lambda j: (j.duration_h, j.priority, j.job_id),
-                reverse=True,
-            )
-
+        # 3. Sort jobs topologically respecting dependencies and objective mode
+        sorted_jobs = self._order_jobs(schedulable_jobs)
         total_work_h = sum(j.duration_h for j in sorted_jobs)
 
         # 4. Sort candidate instances by remaining quota descending, preserving stable order on ties
@@ -195,8 +251,9 @@ class AccelPackScheduler:
                 return plan
             if not allow_partial:
                 raise QuotaExceededException(
-                    f"Workload of {len(jobs)} jobs ({total_work_h:.2f} worker-hours) cannot be balanced "
-                    f"within session timeout and safety quota limits across the {len(instances)} available instances."
+                    f"Heuristic scheduler could not find a placement balancing {len(jobs)} jobs "
+                    f"({total_work_h:.2f} worker-hours) within session timeouts and quota safety buffers "
+                    f"across {len(instances)} available instances."
                 )
 
         # PackingStrategy.CONCENTRATE:
@@ -213,8 +270,8 @@ class AccelPackScheduler:
                 return plan
 
         raise QuotaExceededException(
-            f"Workload of {len(jobs)} jobs ({total_work_h:.2f} worker-hours) cannot fit within "
-            f"available session limits and quota safety buffers."
+            f"Heuristic scheduler could not find a placement packing {len(jobs)} jobs "
+            f"({total_work_h:.2f} worker-hours) within session timeouts and quota safety buffers."
         )
 
     def _create_instance_plan(self, inst: Instance) -> InstancePlan:
@@ -275,7 +332,8 @@ class AccelPackScheduler:
                     d_load = max(d_load, s_load * slowdown)
             dev_loads[d] = d_load
 
-        makespan = max(dev_loads.values(), default=0.0) + self.setup_overhead_h
+        max_load = max(dev_loads.values(), default=0.0)
+        makespan = max_load + (self.setup_overhead_h if max_load > 0 else 0.0)
         billed = inst.debit_rate * makespan
 
         # Aggregate CPU oversubscription estimate
@@ -343,6 +401,10 @@ class AccelPackScheduler:
                     if not self._check_hardware_fit(ip, slot, job):
                         continue
 
+                    # Check checkpoint dependency satisfaction
+                    if not self._check_dependency_satisfaction(job, ip, slot, instance_plans):
+                        continue
+
                     (
                         hyp_dev_loads,
                         hyp_makespan,
@@ -351,8 +413,8 @@ class AccelPackScheduler:
                         cpu_penalty,
                     ) = self._compute_hypothetical_state(ip, slot, job)
 
-                    # Check session cap
-                    if max(hyp_dev_loads.values(), default=0.0) > session_limit:
+                    # Check session cap including setup overhead
+                    if hyp_makespan > session_limit:
                         continue
 
                     # Check reset deadline safely
@@ -383,12 +445,12 @@ class AccelPackScheduler:
                         is_active_device = any(s.load_h > 0 for s in ip.slots if s.device_index == slot.device_index)
                         device_pref = 0 if is_active_device else 1
 
-                        # Sort by: partner_rank (prefer active nodes), -new_efficiency, device_pref, cpu_penalty
+                        # Sort by: partner_rank (prefer active nodes), -new_efficiency, device_pref, weighted cpu_penalty
                         candidate_choices.append((
                             partner_rank,
                             -round(new_efficiency, 4),
                             device_pref,
-                            round(cpu_penalty, 3),
+                            round(self.cpu_penalty_weight * cpu_penalty, 3),
                             ip,
                             slot,
                         ))
@@ -449,6 +511,10 @@ class AccelPackScheduler:
                     if not self._check_hardware_fit(ip, slot, job):
                         continue
 
+                    # Check checkpoint dependency satisfaction
+                    if not self._check_dependency_satisfaction(job, ip, slot, active_plans):
+                        continue
+
                     (
                         hyp_dev_loads,
                         hyp_makespan,
@@ -457,7 +523,8 @@ class AccelPackScheduler:
                         cpu_penalty,
                     ) = self._compute_hypothetical_state(ip, slot, job)
 
-                    if max(hyp_dev_loads.values(), default=0.0) > session_limit:
+                    # Check session cap including setup overhead
+                    if hyp_makespan > session_limit:
                         continue
 
                     if not self._check_reset_deadline(inst, hyp_makespan):
@@ -475,7 +542,8 @@ class AccelPackScheduler:
                     if post_quota_rem < self.quota_buffer_h:
                         continue
 
-                    slot_score = slot.load_h + self.cpu_penalty_weight * cpu_penalty
+                    norm_slot_load = slot.load_h / max(1.0, session_limit)
+                    slot_score = norm_slot_load + self.cpu_penalty_weight * cpu_penalty
                     if best_slot is None or slot_score < best_slot[0]:
                         best_slot = (slot_score, ip, slot)
 

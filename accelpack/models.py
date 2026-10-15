@@ -34,6 +34,9 @@ class Job:
     resumable: bool = False
     segments: Optional[List[float]] = None     # Optional checkpoint segments (hours per segment)
     hardware_class: Optional[str] = None      # Target hardware class requirement (e.g. "nvidia_t4")
+    depends_on: Optional[str] = None          # Prerequisite job_id that must complete before this job
+    parent_job_id: Optional[str] = None       # ID of original unsegmented job
+    segment_index: Optional[int] = None       # 0-indexed sequence position for checkpoint segments
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self):
@@ -105,6 +108,21 @@ class Instance:
             raise ValueError(f"slots_per_device must be > 0, got {self.slots_per_device}")
         if self.debit_rate <= 0:
             raise ValueError(f"debit_rate must be > 0, got {self.debit_rate}")
+
+        # Normalize and validate concurrency_slowdown_factors (coerce string keys from JSON to int)
+        normalized_factors: Dict[int, float] = {}
+        for k, v in self.concurrency_slowdown_factors.items():
+            try:
+                ik = int(k)
+                fv = float(v)
+            except (ValueError, TypeError) as e:
+                raise ValueError(f"Invalid concurrency slowdown factor key/value ({k}: {v}): {e}")
+            if ik <= 0:
+                raise ValueError(f"Worker count in slowdown factors must be > 0, got {ik}")
+            if not math.isfinite(fv) or fv <= 0:
+                raise ValueError(f"Slowdown factor for {ik} workers must be finite and > 0, got {fv}")
+            normalized_factors[ik] = fv
+        self.concurrency_slowdown_factors = normalized_factors
 
     @property
     def max_concurrent_workers(self) -> int:

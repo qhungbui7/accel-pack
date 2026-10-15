@@ -177,3 +177,22 @@ class ProfileDurationEstimator:
                 "has_profile": rec is not None,
             },
         )
+
+    def to_dict_list(self) -> List[Dict[str, Any]]:
+        """Exports all registered profiles to a serializable list of dictionaries."""
+        result = []
+        for (env_id, model, hw, workers), rec in self._profiles.items():
+            result.append({
+                "env_id": env_id,
+                "model": model,
+                "fps": rec.throughput,
+                "vram_gb": rec.vram_gb,
+                "ram_gb": rec.ram_gb,
+                "cpu_cores": rec.cpu_cores,
+                "hardware_class": hw,
+                "workers_per_device": workers,
+                "samples": rec.samples,
+                "confidence": rec.confidence,
+            })
+        return result
+

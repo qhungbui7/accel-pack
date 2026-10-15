@@ -60,6 +60,12 @@ def main():
     reconciler = ExecutionReconciler(history_file=args.history) if args.history else None
     estimator = ProfileDurationEstimator(default_fps=100.0)
 
+    # Replay historical job executions into estimator if history provided
+    if reconciler and reconciler.history:
+        replayed = reconciler.replay_into_estimator(estimator)
+        if replayed > 0:
+            print(f"[OK] Replayed {replayed} historical execution records to initialize throughput profiles.")
+
     if args.profiles and Path(args.profiles).exists():
         try:
             prof_data = json.loads(Path(args.profiles).read_text(encoding="utf-8"))
@@ -101,6 +107,9 @@ def main():
                 estimator=estimator,
             )
             print(f"[OK] Recorded completed job {run_data['job_id']} into history and calibrated profiles.")
+            if args.profiles:
+                Path(args.profiles).write_text(json.dumps(estimator.to_dict_list(), indent=2), encoding="utf-8")
+                print(f"[OK] Persisted {len(estimator.to_dict_list())} updated profiles to {args.profiles}")
         except Exception as e:
             sys.stderr.write(f"[ERROR AccelPack] Failed to record job summary: {e}\n")
 
