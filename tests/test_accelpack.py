@@ -16,7 +16,7 @@ from accelpack.models import (
     PackingStrategy,
 )
 from accelpack.preflight import PreflightValidator
-from accelpack.reconciliation import ExecutionReconciler
+from accelpack.reconciliation import ExecutionReconciler, HistoryPersistenceException
 from accelpack.scheduler import AccelPackScheduler, QuotaExceededException
 
 
@@ -1217,8 +1217,8 @@ def test_legacy_history_migration_deterministic_ids_and_backward_compatibility(t
     count = reconciler.replay_into_estimator(estimator)
     assert count == 2
 
-    # Now test backward compatibility: if profile already has applied_job_ids=["rl_train"],
-    # replaying should respect the legacy application flag
+    # Test backward compatibility and explicit migration: if profile has legacy applied_job_ids=["rl_train"],
+    # the legacy marker is mapped to the earliest run (rec1), and the subsequent distinct run (rec2) is replayed
     estimator_legacy = ProfileDurationEstimator()
     estimator_legacy.register_profile(
         env_id="mujoco",
@@ -1226,9 +1226,17 @@ def test_legacy_history_migration_deterministic_ids_and_backward_compatibility(t
         fps=120.0,
         applied_job_ids=["rl_train"],
     )
-    # Replay should skip applying because rl_train is marked in applied_job_ids
+    # First replay migrates the earliest run and replays the subsequent run (replayed == 1)
     replayed = reconciler.replay_into_estimator(estimator_legacy)
-    assert replayed == 0
+    assert replayed == 1
+    prof = estimator_legacy.get_profile("mujoco", "sac")
+    assert rec1.run_id in prof.applied_run_ids
+    assert rec2.run_id in prof.applied_run_ids
+    assert "rl_train" in prof.migrated_legacy_job_ids
+    assert "rl_train" in prof.applied_job_ids
+
+    # Second replay is strictly idempotent based on execution run_id (replayed == 0)
+    assert reconciler.replay_into_estimator(estimator_legacy) == 0
 
 
 def test_candidate_start_offset_invalid_timing_graph_raises_error():
@@ -1249,6 +1257,249 @@ def test_candidate_start_offset_invalid_timing_graph_raises_error():
     candidate_job = Job(job_id="extra", duration_h=1.0, depends_on="jb1")
     with pytest.raises(ValueError, match="Instance dependency cycle detected"):
         scheduler._get_candidate_instance_start_offset(plan_a, candidate_job, [plan_a, plan_b])
+
+
+def test_telemetry_identical_measurements_concurrency_and_retry_not_colliding(tmp_path):
+    """Verify that executions with identical measurements do not collide when concurrency differs
+    or when retrying a failed attempt, ensuring each run is recorded and calibrated appropriately."""
+    history_file = tmp_path / "history.json"
+    reconciler = ExecutionReconciler(history_file=history_file)
+    estimator = ProfileDurationEstimator(default_fps=100.0)
+
+    # Case 1: Identical measurements with different concurrency levels (workers=1 vs workers=2)
+    # Both runs have identical job_id, env_id, model, steps, and duration!
+    rec_w1 = reconciler.record_job(
+        job_id="train_rl",
+        env_id="cartpole",
+        model="dqn",
+        steps=360000,
+        predicted_duration_h=1.0,
+        actual_duration_h=1.0,  # 100 FPS
+        success=True,
+        instance_id="node-1",
+        concurrent_workers_on_device=1,
+        hardware_class="nvidia_t4",
+        estimator=estimator,
+    )
+
+    rec_w2 = reconciler.record_job(
+        job_id="train_rl",
+        env_id="cartpole",
+        model="dqn",
+        steps=360000,
+        predicted_duration_h=1.0,
+        actual_duration_h=1.0,  # 100 FPS
+        success=True,
+        instance_id="node-1",
+        concurrent_workers_on_device=2,  # Different concurrency level
+        hardware_class="nvidia_t4",
+        estimator=estimator,
+    )
+
+    # Distinct run IDs generated; both executions recorded in history
+    assert rec_w1.run_id != rec_w2.run_id
+    assert len(reconciler.history) == 2
+    assert reconciler.history[0].run_id == rec_w1.run_id
+    assert reconciler.history[1].run_id == rec_w2.run_id
+
+    # Each execution calibrated its isolated concurrency profile
+    p1 = estimator.get_profile("cartpole", "dqn", "nvidia_t4", workers_per_device=1)
+    p2 = estimator.get_profile("cartpole", "dqn", "nvidia_t4", workers_per_device=2)
+    assert p1 is not None and rec_w1.run_id in p1.applied_run_ids
+    assert p2 is not None and rec_w2.run_id in p2.applied_run_ids
+
+    # Case 2: Failed attempt followed by successful retry with identical measurements
+    rec_fail = reconciler.record_job(
+        job_id="cifar_eval",
+        env_id="cifar",
+        model="resnet",
+        steps=180000,
+        predicted_duration_h=1.0,
+        actual_duration_h=0.5,
+        success=False,  # Failed attempt
+        instance_id="node-1",
+        estimator=estimator,
+    )
+
+    rec_retry = reconciler.record_job(
+        job_id="cifar_eval",
+        env_id="cifar",
+        model="resnet",
+        steps=180000,
+        predicted_duration_h=1.0,
+        actual_duration_h=0.5,
+        success=True,  # Successful retry
+        instance_id="node-1",
+        estimator=estimator,
+    )
+
+    assert rec_fail.run_id != rec_retry.run_id
+    assert len(reconciler.history) == 4
+    # The failed attempt did not calibrate, but the successful retry DID calibrate
+    prof_cifar = estimator.get_profile("cifar", "resnet", "nvidia_t4", workers_per_device=1)
+    assert prof_cifar is not None
+    assert rec_retry.run_id in prof_cifar.applied_run_ids
+    assert rec_fail.run_id not in prof_cifar.applied_run_ids
+
+    # Case 3: Re-submitting the exact same record with its persisted run_id is idempotent
+    rec_retry_dup = reconciler.record_job(
+        job_id="cifar_eval",
+        env_id="cifar",
+        model="resnet",
+        steps=180000,
+        predicted_duration_h=1.0,
+        actual_duration_h=0.5,
+        success=True,
+        instance_id="node-1",
+        run_id=rec_retry.run_id,  # Reusing assigned run_id
+        estimator=estimator,
+    )
+    assert rec_retry_dup is rec_retry
+    assert len(reconciler.history) == 4  # No duplicate history record
+    assert prof_cifar.samples == 1       # No duplicate sample count
+
+
+def test_history_persistence_failure_surfaced_and_rolled_back(tmp_path, monkeypatch):
+    """Verify that history write failures raise HistoryPersistenceException, roll back in-memory additions,
+    prevent unpersisted profile updates, and CLI outputs an error instead of success."""
+    import os
+    from accelpack import cli
+
+    history_file = tmp_path / "protected" / "history.json"
+    reconciler = ExecutionReconciler(history_file=history_file)
+    estimator = ProfileDurationEstimator(default_fps=100.0)
+
+    # Monkeypatch os.replace to simulate disk write failure
+    def mock_replace(src, dst):
+        raise OSError("Disk quota exceeded or read-only filesystem")
+
+    monkeypatch.setattr(os, "replace", mock_replace)
+
+    with pytest.raises(HistoryPersistenceException, match="Failed to write history file"):
+        reconciler.record_job(
+            job_id="job_failing",
+            env_id="env_x",
+            model="model_y",
+            steps=100000,
+            predicted_duration_h=1.0,
+            actual_duration_h=1.0,
+            instance_id="n1",
+            success=True,
+            estimator=estimator,
+        )
+
+    # Verify rollback: history is empty and profile was not updated in memory
+    assert len(reconciler.history) == 0
+    assert len(estimator._profiles) == 0
+    assert estimator.get_profile("env_x", "model_y") is None
+
+    # CLI verification: --record-job with persistence failure prints error and not [OK]
+    record_file = tmp_path / "record.json"
+    record_file.write_text(json.dumps({
+        "job_id": "job_cli_fail",
+        "env_id": "env_cli",
+        "model": "model_cli",
+        "steps": 50000,
+        "predicted_duration_h": 1.0,
+        "actual_duration_h": 0.5,
+        "instance_id": "n1",
+        "success": True,
+    }))
+
+    inst_file = tmp_path / "inst.json"
+    inst_file.write_text(json.dumps([{"instance_id": "n1", "device_count": 1, "remaining_quota_h": 10.0}]))
+    jobs_file = tmp_path / "jobs.json"
+    jobs_file.write_text(json.dumps([{"job_id": "dummy", "duration_h": 1.0}]))
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "accelpack.cli",
+            "--instances", str(inst_file),
+            "--jobs", str(jobs_file),
+            "--history", str(history_file),
+            "--record-job", str(record_file),
+        ],
+    )
+
+    import io
+    import sys
+    out_capture = io.StringIO()
+    err_capture = io.StringIO()
+    monkeypatch.setattr(sys, "stdout", out_capture)
+    monkeypatch.setattr(sys, "stderr", err_capture)
+
+    cli.main()
+
+    stdout_text = out_capture.getvalue()
+    stderr_text = err_capture.getvalue()
+
+    assert "[OK] Recorded completed job" not in stdout_text
+    assert "[ERROR AccelPack] Failed to persist job execution history" in stderr_text
+
+
+def test_shared_account_remaining_quota_summary_and_cli_export(tmp_path, monkeypatch):
+    """Verify that individual instance rows and exported JSON display aggregate account remaining quota
+    rather than misleading per-instance remaining balances."""
+    from accelpack import cli
+
+    # Two instances sharing account 'shared_acc' with declared quota 10.0h, max session 2.5h
+    inst_a = Instance(instance_id="node_a", account_id="shared_acc", device_count=1, max_session_h=2.5, remaining_quota_h=10.0)
+    inst_b = Instance(instance_id="node_b", account_id="shared_acc", device_count=1, max_session_h=2.5, remaining_quota_h=10.0)
+
+    # Two jobs of 2.0h each, running on separate instances
+    j1 = Job(job_id="job_1", duration_h=2.0)
+    j2 = Job(job_id="job_2", duration_h=2.0)
+
+    scheduler = AccelPackScheduler(setup_overhead_h=0.0)
+    plan = scheduler.schedule([j1, j2], [inst_a, inst_b])
+
+    assert len(plan.active_instances) == 2
+    # Both instances billed 2.0h -> aggregate debit is 4.0h -> remaining balance is 6.0h
+    account_rem = plan.account_remaining_quota()
+    assert account_rem["shared_acc"] == pytest.approx(6.0)
+
+    summary_text = plan.summary()
+    assert "Account Quota Remaining: 6.00h" in summary_text
+    # Should NOT display 8.00h as the remaining balance
+    assert "Account Quota Remaining: 8.00h" not in summary_text
+
+    # CLI export verification
+    inst_file = tmp_path / "inst.json"
+    jobs_file = tmp_path / "jobs.json"
+    out_file = tmp_path / "out.json"
+
+    inst_file.write_text(json.dumps([
+        {"instance_id": "node_a", "account_id": "shared_acc", "device_count": 1, "max_session_h": 2.5, "remaining_quota_h": 10.0},
+        {"instance_id": "node_b", "account_id": "shared_acc", "device_count": 1, "max_session_h": 2.5, "remaining_quota_h": 10.0},
+    ]))
+    jobs_file.write_text(json.dumps([
+        {"job_id": "job_1", "duration_h": 2.0},
+        {"job_id": "job_2", "duration_h": 2.0},
+    ]))
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "accelpack.cli",
+            "--instances", str(inst_file),
+            "--jobs", str(jobs_file),
+            "--setup-overhead", "0.0",
+            "--output", str(out_file),
+        ],
+    )
+    cli.main()
+
+    exported = json.loads(out_file.read_text(encoding="utf-8"))
+    assert exported["account_remaining_quota"]["shared_acc"] == pytest.approx(6.0)
+
+    for inst_json in exported["instances"]:
+        # Shared account quota balance
+        assert inst_json["account_quota_remaining_after_h"] == pytest.approx(6.0)
+        assert inst_json["quota_remaining_after_h"] == pytest.approx(6.0)
+        # Instance-alone balance preserved for debugging
+        assert inst_json["instance_alone_quota_remaining_h"] == pytest.approx(8.0)
+
 
 
 

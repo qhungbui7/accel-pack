@@ -18,11 +18,13 @@ class ProfileRecord:
     hardware_class: str = "nvidia_t4"
     workers_per_device: int = 1
     applied_run_ids: List[str] = field(default_factory=list)
+    legacy_job_ids: List[str] = field(default_factory=list)
+    migrated_legacy_job_ids: List[str] = field(default_factory=list)
 
     @property
     def applied_job_ids(self) -> List[str]:
-        """Backward-compatible alias for applied_run_ids."""
-        return self.applied_run_ids
+        """Backward-compatible alias for applied_run_ids and legacy job markers."""
+        return list(dict.fromkeys(self.applied_run_ids + self.legacy_job_ids + self.migrated_legacy_job_ids))
 
 
 class ProfileDurationEstimator:
@@ -63,12 +65,55 @@ class ProfileDurationEstimator:
         confidence: float = 1.0,
         applied_run_ids: Optional[List[str]] = None,
         applied_job_ids: Optional[List[str]] = None,
+        migrated_legacy_job_ids: Optional[List[str]] = None,
     ) -> None:
         """Registers empirical execution profile isolated by hardware class and concurrency level."""
         if fps <= 0:
             raise ValueError(f"FPS must be positive, got {fps}")
         key = self._normalize_key(env_id, model, hardware_class, workers_per_device)
-        applied = list(applied_run_ids or applied_job_ids or [])
+        applied_runs = list(applied_run_ids or [])
+        legacy_jobs = list(applied_job_ids or [])
+        already_migrated = list(migrated_legacy_job_ids or [])
+
+        clean_run_ids: List[str] = []
+        clean_legacy_ids: List[str] = []
+        clean_migrated_ids: List[str] = []
+
+        for item in applied_runs:
+            if item.startswith("run_") or item.startswith("legacy_"):
+                if item not in clean_run_ids:
+                    clean_run_ids.append(item)
+            elif item in already_migrated:
+                if item not in clean_migrated_ids:
+                    clean_migrated_ids.append(item)
+            else:
+                if item not in clean_legacy_ids:
+                    clean_legacy_ids.append(item)
+
+        for item in legacy_jobs:
+            if item.startswith("run_") or item.startswith("legacy_"):
+                if item not in clean_run_ids:
+                    clean_run_ids.append(item)
+            elif item in already_migrated:
+                if item not in clean_migrated_ids:
+                    clean_migrated_ids.append(item)
+            else:
+                if item not in clean_legacy_ids:
+                    clean_legacy_ids.append(item)
+
+        for item in already_migrated:
+            if item not in clean_migrated_ids:
+                clean_migrated_ids.append(item)
+            if item in clean_legacy_ids:
+                clean_legacy_ids.remove(item)
+
+        # If any legacy job id already has a corresponding run in clean_run_ids, it is already migrated
+        for leg_id in list(clean_legacy_ids):
+            if any(rid.startswith(f"legacy_{leg_id}_") or rid == leg_id for rid in clean_run_ids):
+                clean_legacy_ids.remove(leg_id)
+                if leg_id not in clean_migrated_ids:
+                    clean_migrated_ids.append(leg_id)
+
         self._profiles[key] = ProfileRecord(
             throughput=float(fps),
             samples=samples,
@@ -78,7 +123,9 @@ class ProfileDurationEstimator:
             cpu_cores=cpu_cores,
             hardware_class=hardware_class.strip().lower(),
             workers_per_device=max(1, workers_per_device),
-            applied_run_ids=applied,
+            applied_run_ids=clean_run_ids,
+            legacy_job_ids=clean_legacy_ids,
+            migrated_legacy_job_ids=clean_migrated_ids,
         )
 
     def get_profile(
@@ -204,7 +251,8 @@ class ProfileDurationEstimator:
                 "samples": rec.samples,
                 "confidence": rec.confidence,
                 "applied_run_ids": list(rec.applied_run_ids),
-                "applied_job_ids": list(rec.applied_run_ids),
+                "applied_job_ids": list(rec.applied_job_ids),
+                "migrated_legacy_job_ids": list(rec.migrated_legacy_job_ids),
             })
         return result
 

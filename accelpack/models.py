@@ -391,8 +391,21 @@ class ExecutionPlan:
             accts[acc_id] = accts.get(acc_id, 0.0) + ip.billed_resource_h
         return accts
 
+    def account_remaining_quota(self) -> Dict[str, float]:
+        """Aggregate remaining quota hours after all planned active instance debits, grouped by account_id."""
+        acct_billed = self.account_billed_quota()
+        rem_map: Dict[str, float] = {}
+        for ip in self.instance_plans:
+            acc_id = ip.instance.account_id or ip.instance.instance_id
+            if acc_id not in rem_map:
+                pool_quota = ip.instance.remaining_quota_h
+                billed = acct_billed.get(acc_id, 0.0)
+                rem_map[acc_id] = max(0.0, pool_quota - billed)
+        return rem_map
+
     def summary(self) -> str:
         start_times, finish_times = self.instance_schedule_timings()
+        acct_rem_map = self.account_remaining_quota()
         lines = [
             "=" * 70,
             "ACCELPACK WORKLOAD SCHEDULE SUMMARY",
@@ -412,7 +425,7 @@ class ExecutionPlan:
         if len(acct_billed) > 1 or any(ip.instance.account_id != ip.instance.instance_id for ip in self.instance_plans):
             lines.append("ACCOUNT QUOTA POOLS:")
             for acc_id, billed in acct_billed.items():
-                matching_insts = [ip.instance for ip in self.instance_plans if ip.instance.account_id == acc_id]
+                matching_insts = [ip.instance for ip in self.instance_plans if (ip.instance.account_id or ip.instance.instance_id) == acc_id]
                 pool_quota = matching_insts[0].remaining_quota_h if matching_insts else 0.0
                 rem_after = max(0.0, pool_quota - billed)
                 lines.append(f"  * Account [{acc_id}]: Billed {billed:.2f}h | Remaining After {rem_after:.2f}h / {pool_quota:.2f}h")
@@ -421,6 +434,7 @@ class ExecutionPlan:
         for ip in self.active_instances:
             acc = ip.instance
             inst_id = acc.instance_id
+            acc_id = acc.account_id or inst_id
             t_start = start_times.get(inst_id, 0.0)
             t_finish = finish_times.get(inst_id, ip.makespan_h)
             timing_info = f"Makespan: {ip.makespan_h:.2f}h"
@@ -431,10 +445,11 @@ class ExecutionPlan:
             if ip.is_cpu_oversubscribed:
                 cpu_status += " [OVERSUBSCRIBED - Soft Penalty Applied]"
 
+            shared_quota_rem = acct_rem_map.get(acc_id, ip.quota_remaining_after_h)
             lines.append(
                 f"[{acc.instance_id} (Account: {acc.account_id})] {timing_info} | "
                 f"Billed: {ip.billed_resource_h:.2f}h | "
-                f"Quota Remaining After: {ip.quota_remaining_after_h:.2f}h | "
+                f"Account Quota Remaining: {shared_quota_rem:.2f}h | "
                 f"Workers: {ip.peak_concurrent_workers}/{acc.max_concurrent_workers}"
             )
             lines.append(f"  CPU Demand: {cpu_status}")

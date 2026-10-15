@@ -6,12 +6,13 @@ import argparse
 import hashlib
 import json
 import sys
+import uuid
 from pathlib import Path
 
 from accelpack.estimator import ProfileDurationEstimator
 from accelpack.models import Instance, Job, ObjectiveMode, PackingStrategy
 from accelpack.preflight import PreflightValidator
-from accelpack.reconciliation import ExecutionReconciler
+from accelpack.reconciliation import ExecutionReconciler, HistoryPersistenceException
 from accelpack.scheduler import AccelPackScheduler, QuotaExceededException
 
 
@@ -77,7 +78,9 @@ def main():
                     workers_per_device=p.get("workers_per_device", 1),
                     samples=p.get("samples", 1),
                     confidence=p.get("confidence", 1.0),
-                    applied_run_ids=p.get("applied_run_ids", p.get("applied_job_ids", [])),
+                    applied_run_ids=p.get("applied_run_ids"),
+                    applied_job_ids=p.get("applied_job_ids"),
+                    migrated_legacy_job_ids=p.get("migrated_legacy_job_ids"),
                 )
         except Exception as e:
             sys.stderr.write(f"[WARN AccelPack] Could not load profiles database {args.profiles}: {e}\n")
@@ -96,18 +99,10 @@ def main():
             run_path = Path(args.record_job)
             run_data = json.loads(run_path.read_text(encoding="utf-8"))
 
-            # Ensure a stable run_id exists and persist back if newly generated
+            # Ensure a stable run_id exists; if missing, generate a UUID once and persist it back
             if not run_data.get("run_id"):
                 jid = run_data.get("job_id", "job")
-                inst_id = run_data.get("instance_id", "")
-                dev_idx = run_data.get("device_index", 0)
-                steps = run_data.get("steps", 0)
-                dur = run_data.get("actual_duration_h", 0.0)
-                env = run_data.get("env_id", "")
-                mod = run_data.get("model", "")
-                hw = run_data.get("hardware_class", "nvidia_t4")
-                content_sig = f"{jid}:{inst_id}:{dev_idx}:{steps}:{dur:.4f}:{env}:{mod}:{hw}"
-                assigned_run_id = f"run_{jid}_{hashlib.sha256(content_sig.encode('utf-8')).hexdigest()[:10]}"
+                assigned_run_id = f"run_{jid}_{uuid.uuid4().hex[:12]}"
                 run_data["run_id"] = assigned_run_id
                 try:
                     run_path.write_text(json.dumps(run_data, indent=2), encoding="utf-8")
@@ -125,7 +120,7 @@ def main():
                 instance_id=run_data.get("instance_id", ""),
                 run_id=run_data.get("run_id"),
                 device_index=run_data.get("device_index", 0),
-                concurrent_workers_on_device=run_data.get("concurrent_workers", 1),
+                concurrent_workers_on_device=run_data.get("concurrent_workers") or run_data.get("concurrent_workers_on_device", 1),
                 hardware_class=run_data.get("hardware_class", "nvidia_t4"),
                 peak_vram_gb=run_data.get("peak_vram_gb"),
                 peak_ram_gb=run_data.get("peak_ram_gb"),
@@ -136,6 +131,8 @@ def main():
             if args.profiles:
                 Path(args.profiles).write_text(json.dumps(estimator.to_dict_list(), indent=2), encoding="utf-8")
                 print(f"[OK] Persisted {len(estimator.to_dict_list())} updated profiles to {args.profiles}")
+        except HistoryPersistenceException as e:
+            sys.stderr.write(f"[ERROR AccelPack] Failed to persist job execution history: {e}\n")
         except Exception as e:
             sys.stderr.write(f"[ERROR AccelPack] Failed to record job summary: {e}\n")
 
@@ -251,19 +248,23 @@ def main():
     print(plan.summary())
 
     if args.output:
+        acct_rem_map = plan.account_remaining_quota()
         export_data = {
             "global_makespan_h": plan.global_makespan_h,
             "total_work_h": plan.total_work_h,
             "total_billed_resource_h": plan.total_billed_resource_h,
             "quota_productivity_ratio": plan.quota_productivity_ratio,
             "account_billed_quota": plan.account_billed_quota(),
+            "account_remaining_quota": acct_rem_map,
             "instances": [
                 {
                     "instance_id": ip.instance.instance_id,
                     "account_id": ip.instance.account_id,
                     "makespan_h": ip.makespan_h,
                     "billed_resource_h": ip.billed_resource_h,
-                    "quota_remaining_after_h": ip.quota_remaining_after_h,
+                    "quota_remaining_after_h": acct_rem_map.get(ip.instance.account_id or ip.instance.instance_id, ip.quota_remaining_after_h),
+                    "account_quota_remaining_after_h": acct_rem_map.get(ip.instance.account_id or ip.instance.instance_id, ip.quota_remaining_after_h),
+                    "instance_alone_quota_remaining_h": ip.quota_remaining_after_h,
                     "peak_concurrent_workers": ip.peak_concurrent_workers,
                     "cpu_oversubscription_ratio": ip.cpu_oversubscription_ratio,
                     "is_cpu_oversubscribed": ip.is_cpu_oversubscribed,
