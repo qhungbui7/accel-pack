@@ -7,6 +7,7 @@ running separate diagnostic benchmark sessions.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import sys
@@ -70,9 +71,14 @@ class ExecutionReconciler:
         if self.history_file and self.history_file.exists():
             try:
                 data = json.loads(self.history_file.read_text(encoding="utf-8"))
-                for r in data:
-                    if "run_id" not in r:
-                        r["run_id"] = r.get("run_id") or r.get("job_id") or uuid.uuid4().hex[:12]
+                for idx, r in enumerate(data):
+                    if "run_id" not in r or not r["run_id"]:
+                        jid = r.get("job_id", "job")
+                        ts = r.get("timestamp", str(idx))
+                        steps = r.get("steps", 0)
+                        dur = r.get("actual_duration_h", 0.0)
+                        content_sig = f"{jid}:{ts}:{steps}:{dur}:{idx}"
+                        r["run_id"] = f"legacy_{jid}_{idx}_{hashlib.sha256(content_sig.encode('utf-8')).hexdigest()[:8]}"
                     self.history.append(JobExecutionRecord(**r))
             except Exception as e:
                 self.load_error = f"Corrupted or invalid history file {self.history_file}: {e}"
@@ -110,7 +116,11 @@ class ExecutionReconciler:
         estimator: Optional[ProfileDurationEstimator] = None,
     ) -> JobExecutionRecord:
         """Records a completed job execution and updates the duration estimator profile idempotently."""
-        effective_run_id = run_id or uuid.uuid4().hex[:12]
+        if not run_id:
+            content_sig = f"{job_id}:{instance_id}:{device_index}:{steps}:{actual_duration_h:.4f}:{env_id}:{model}:{hardware_class}"
+            effective_run_id = f"run_{job_id}_{hashlib.sha256(content_sig.encode('utf-8')).hexdigest()[:10]}"
+        else:
+            effective_run_id = run_id
 
         # Check if already recorded in self.history (idempotent submission)
         for existing_h in self.history:
@@ -281,7 +291,7 @@ class ExecutionReconciler:
                     hardware_class=rec.hardware_class,
                     workers_per_device=rec.concurrent_workers_on_device,
                 )
-                if existing and rec.run_id in existing.applied_run_ids:
+                if existing and (rec.run_id in existing.applied_run_ids or rec.job_id in existing.applied_job_ids):
                     # Skip duplicate application
                     continue
 

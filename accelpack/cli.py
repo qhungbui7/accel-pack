@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -92,7 +93,27 @@ def main():
     # Record completed job if requested
     if args.record_job and Path(args.record_job).exists() and reconciler:
         try:
-            run_data = json.loads(Path(args.record_job).read_text(encoding="utf-8"))
+            run_path = Path(args.record_job)
+            run_data = json.loads(run_path.read_text(encoding="utf-8"))
+
+            # Ensure a stable run_id exists and persist back if newly generated
+            if not run_data.get("run_id"):
+                jid = run_data.get("job_id", "job")
+                inst_id = run_data.get("instance_id", "")
+                dev_idx = run_data.get("device_index", 0)
+                steps = run_data.get("steps", 0)
+                dur = run_data.get("actual_duration_h", 0.0)
+                env = run_data.get("env_id", "")
+                mod = run_data.get("model", "")
+                hw = run_data.get("hardware_class", "nvidia_t4")
+                content_sig = f"{jid}:{inst_id}:{dev_idx}:{steps}:{dur:.4f}:{env}:{mod}:{hw}"
+                assigned_run_id = f"run_{jid}_{hashlib.sha256(content_sig.encode('utf-8')).hexdigest()[:10]}"
+                run_data["run_id"] = assigned_run_id
+                try:
+                    run_path.write_text(json.dumps(run_data, indent=2), encoding="utf-8")
+                except Exception:
+                    pass  # Non-fatal if input file is read-only
+
             reconciler.record_job(
                 job_id=run_data["job_id"],
                 env_id=run_data.get("env_id", ""),

@@ -103,15 +103,24 @@ class AccelPackScheduler:
         return normalized
 
     def _expand_segmented_jobs(self, jobs: List[Job]) -> List[Job]:
-        """Expands jobs with checkpoint segments into schedulable discrete segment units with explicit dependencies."""
+        """Expands jobs with checkpoint segments into schedulable discrete segment units with explicit dependencies,
+        remapping any downstream child dependencies pointing to segmented parents to the parent's final segment unit.
+        """
         if not self.expand_segments:
             return jobs
 
+        parent_to_final_seg: Dict[str, str] = {
+            j.job_id: f"{j.job_id}_seg{len(j.segments) - 1}"
+            for j in jobs
+            if j.segments and len(j.segments) > 0
+        }
+
         expanded: List[Job] = []
         for j in jobs:
+            initial_dep = parent_to_final_seg.get(j.depends_on, j.depends_on)
             if j.segments and len(j.segments) > 0:
                 for idx, seg_dur in enumerate(j.segments):
-                    prev_id = f"{j.job_id}_seg{idx - 1}" if idx > 0 else j.depends_on
+                    prev_id = f"{j.job_id}_seg{idx - 1}" if idx > 0 else initial_dep
                     seg_job = Job(
                         job_id=f"{j.job_id}_seg{idx}",
                         duration_h=seg_dur,
@@ -134,7 +143,12 @@ class AccelPackScheduler:
                     )
                     expanded.append(seg_job)
             else:
-                expanded.append(j)
+                if j.depends_on != initial_dep:
+                    j_copy = copy.copy(j)
+                    j_copy.depends_on = initial_dep
+                    expanded.append(j_copy)
+                else:
+                    expanded.append(j)
         return expanded
 
     def _validate_dependency_graph(self, jobs: List[Job]) -> None:
@@ -312,11 +326,7 @@ class AccelPackScheduler:
             return 0.0
 
         # Calculate finish times of those external prerequisite instances
-        try:
-            _, finish_times = ExecutionPlan(instance_plans=all_plans).instance_schedule_timings()
-        except ValueError:
-            finish_times = {ip.instance.instance_id: ip.makespan_h for ip in all_plans}
-
+        _, finish_times = ExecutionPlan(instance_plans=all_plans).instance_schedule_timings()
         return max((finish_times.get(p_id, 0.0) for p_id in external_prereq_inst_ids), default=0.0)
 
     def schedule(
@@ -342,7 +352,16 @@ class AccelPackScheduler:
         # 1. Authoritative account quota normalization
         normalized_instances = self._normalize_account_quotas(instances)
 
-        # 2. Validate job ID uniqueness
+        # 2. Validate instance ID uniqueness
+        inst_id_counts = collections.Counter(inst.instance_id for inst in instances)
+        dup_insts = [iid for iid, count in inst_id_counts.items() if count > 1]
+        if dup_insts:
+            raise ValueError(
+                f"Duplicate instance ID detected in instances: {dup_insts}. "
+                f"Every compute instance must have a unique identifier."
+            )
+
+        # 3. Validate job ID uniqueness
         job_id_counts = collections.Counter(j.job_id for j in jobs)
         duplicates = [jid for jid, count in job_id_counts.items() if count > 1]
         if duplicates:
@@ -384,6 +403,7 @@ class AccelPackScheduler:
         if self.strategy == PackingStrategy.BALANCE:
             plan = self._pack_balance_waterfill(sorted_jobs, candidate_instances, allow_partial=allow_partial)
             if plan is not None and (allow_partial or not plan.unassigned_jobs):
+                self._validate_final_plan_deadlines(plan)
                 return plan
             if not allow_partial:
                 raise QuotaExceededException(
@@ -398,11 +418,13 @@ class AccelPackScheduler:
             subset = candidate_instances[:k]
             plan = self._pack_greedy(sorted_jobs, subset, candidate_instances, allow_partial=False)
             if plan is not None and not plan.unassigned_jobs:
+                self._validate_final_plan_deadlines(plan)
                 return plan
 
         if allow_partial:
             plan = self._pack_greedy(sorted_jobs, candidate_instances, candidate_instances, allow_partial=True)
             if plan is not None:
+                self._validate_final_plan_deadlines(plan)
                 return plan
 
         raise QuotaExceededException(
@@ -484,7 +506,7 @@ class AccelPackScheduler:
 
         return dev_loads, makespan, billed, cpu_ratio, cpu_penalty
 
-    def _check_reset_deadline(self, inst: Instance, hypothetical_makespan: float) -> bool:
+    def _check_reset_deadline(self, inst: Instance, finish_offset_h: float) -> bool:
         """Returns True if schedule respects quota reset deadline. Fails safe (False) on invalid/stale timestamps."""
         if not (self.enforce_reset_deadline or inst.must_finish_before_reset):
             return True
@@ -502,14 +524,69 @@ class AccelPackScheduler:
             if hours_to_reset <= 0:
                 return False
 
-            # Planned makespan must not cross the deadline
-            if hypothetical_makespan > hours_to_reset:
+            # Planned finish offset must not cross the deadline
+            if finish_offset_h > hours_to_reset:
                 return False
 
             return True
         except Exception:
             # Malformed timestamp with deadline enforcement requested -> Fail safe
             return False
+
+    def _check_hypothetical_placement_deadlines(
+        self,
+        candidate_ip: InstancePlan,
+        candidate_slot: DeviceSlot,
+        job: Job,
+        all_plans: List[InstancePlan],
+    ) -> bool:
+        """Verifies that placing job into candidate_slot does not cause any active instance in the fleet
+        (including candidate_ip and already-scheduled downstream dependent instances) to violate its reset deadline.
+        Fails safe (returns False) if the placement introduces an instance-level timing cycle or invalid graph.
+        """
+        # If no instances require deadline enforcement, skip expensive timing calculation
+        needs_deadline_check = any(
+            self.enforce_reset_deadline or ip.instance.must_finish_before_reset
+            for ip in all_plans
+            if ip.is_active or ip is candidate_ip
+        )
+        if not needs_deadline_check:
+            return True
+
+        candidate_slot.jobs.append(job)
+        candidate_slot.load_h += job.duration_h
+        try:
+            active = [p for p in all_plans if p.is_active]
+            if not active:
+                return True
+            try:
+                _, finish_times = ExecutionPlan(instance_plans=active).instance_schedule_timings()
+            except ValueError:
+                # Cycle or invalid dependency graph induced by hypothetical placement -> reject placement
+                return False
+
+            for p in active:
+                finish_offset = finish_times.get(p.instance.instance_id, 0.0)
+                if not self._check_reset_deadline(p.instance, finish_offset):
+                    return False
+            return True
+        finally:
+            candidate_slot.jobs.pop()
+            candidate_slot.load_h -= job.duration_h
+
+    def _validate_final_plan_deadlines(self, plan: ExecutionPlan) -> None:
+        """Validates that all active instances in the finalized plan satisfy their quota reset deadlines."""
+        if not plan.active_instances:
+            return
+        _, finish_times = plan.instance_schedule_timings()
+        for ip in plan.active_instances:
+            inst = ip.instance
+            finish_offset = finish_times.get(inst.instance_id, 0.0)
+            if not self._check_reset_deadline(inst, finish_offset):
+                raise QuotaExceededException(
+                    f"Instance '{inst.instance_id}' planned finish offset ({finish_offset:.2f}h) "
+                    f"violates quota reset deadline. Reset timestamp is '{inst.reset_at}'."
+                )
 
     def _pack_balance_waterfill(
         self,
@@ -553,10 +630,8 @@ class AccelPackScheduler:
                     if hyp_makespan > session_limit:
                         continue
 
-                    # Check reset deadline safely against completion time relative to t=0
-                    inst_start_offset = self._get_candidate_instance_start_offset(ip, job, instance_plans)
-                    hyp_finish_offset = inst_start_offset + hyp_makespan
-                    if not self._check_reset_deadline(inst, hyp_finish_offset):
+                    # Check reset deadline safely across all active instances (candidate and downstream)
+                    if not self._check_hypothetical_placement_deadlines(ip, slot, job, instance_plans):
                         continue
 
                     # Check account-level shared quota buffer against authoritative pool
@@ -665,10 +740,8 @@ class AccelPackScheduler:
                     if hyp_makespan > session_limit:
                         continue
 
-                    # Check reset deadline safely against completion time relative to t=0
-                    inst_start_offset = self._get_candidate_instance_start_offset(ip, job, active_plans)
-                    hyp_finish_offset = inst_start_offset + hyp_makespan
-                    if not self._check_reset_deadline(inst, hyp_finish_offset):
+                    # Check reset deadline safely across all active instances (candidate and downstream)
+                    if not self._check_hypothetical_placement_deadlines(ip, slot, job, active_plans):
                         continue
 
                     acc_id = self._get_account_id(inst)

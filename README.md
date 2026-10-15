@@ -123,7 +123,7 @@ Preserved Instances (Untouched): node-02 (24.0h), node-03 (24.0h)
 - **Sequential RAM Reuse:** Sequential jobs assigned to the same worker slot track peak RAM usage without spurious aggregate sum rejections.
 - **Fail-Safe Reset Enforcement:** Blocks execution safely if reset deadlines have passed or timestamp metadata is missing/malformed.
 - **Shared Account Normalization:** Eliminates conflicting quota declarations for instances sharing an `account_id` by adopting the authoritative minimum.
-- **Resumable Checkpoint Segments:** Automatically expands workloads exceeding session timeouts into dependency-ordered discrete segment assignments (`expand_segments=True`). AccelPack generates sequential execution plans across worker slots and multi-session instances with dependency-aware critical-path timing; the execution controller (e.g., runner or container orchestrator) is responsible for artifact staging, checkpoint saving/resumption, and honoring inter-session dependency metadata.
+- **Resumable Checkpoint Segments:** Expands jobs with explicitly declared checkpoint segments (`segments=[...]`) into dependency-ordered discrete segment assignments (`expand_segments=True`), remapping downstream child dependencies to the parent's final segment. AccelPack generates sequential execution plans across worker slots and multi-session instances with dependency-aware critical-path timing; the execution controller (e.g., runner or container orchestrator) is responsible for artifact staging, checkpoint saving/resumption, and honoring inter-session dependency metadata.
 
 ### Execution Orchestration Boundary
 

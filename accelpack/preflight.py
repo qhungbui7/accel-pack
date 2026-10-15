@@ -94,6 +94,19 @@ class PreflightValidator:
                 )
             )
 
+        inst_ids = [inst.instance_id for inst in instances]
+        dup_inst_ids = [iid for iid in set(inst_ids) if inst_ids.count(iid) > 1]
+        if dup_inst_ids:
+            issues.append(
+                PreflightIssue(
+                    severity="BLOCKER",
+                    code="DUPLICATE_INSTANCE_ID",
+                    message=f"Duplicate instance ID detected in fleet: {dup_inst_ids}. Every instance must have a unique identifier.",
+                    target_id=",".join(dup_inst_ids),
+                    remediation="Assign unique instance_id values to each compute instance.",
+                )
+            )
+
         # Group instances by account_id to normalize shared account quotas
         accounts: Dict[str, List[Instance]] = {}
         for inst in instances:

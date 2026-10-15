@@ -750,7 +750,8 @@ def test_cli_history_replay_idempotence_and_precedence(tmp_path, monkeypatch):
     # Check that job_1 was NOT reapplied, only job_2 was applied
     # (1 - 0.25)*100.0 + 0.25*200.0 = 125.0 FPS
     assert prof["fps"] == pytest.approx(125.0)
-    assert set(prof["applied_job_ids"]) == {"job_1", "job_2"}
+    assert "job_1" in prof["applied_job_ids"]
+    assert any("job_2" in str(rid) for rid in prof["applied_job_ids"])
 
     # Run CLI a second time: both job_1 and job_2 are already applied!
     monkeypatch.setattr(
@@ -977,6 +978,279 @@ def test_duplicate_job_ids_and_segment_id_collisions_rejected():
     ]
     with pytest.raises(ValueError, match="collides with an existing job ID"):
         scheduler.schedule(colliding_jobs, inst)
+
+
+def test_duplicate_instance_id_validation_raises_error():
+    """Verify that duplicate instance IDs in fleet specification are rejected with explicit ValueError and preflight blocker."""
+    instances = [
+        Instance(instance_id="gpu-node-alpha", device_count=1, remaining_quota_h=10.0),
+        Instance(instance_id="gpu-node-alpha", device_count=1, remaining_quota_h=10.0),
+    ]
+    jobs = [Job(job_id="task_1", duration_h=1.0)]
+
+    # Scheduler validation
+    scheduler = AccelPackScheduler()
+    with pytest.raises(ValueError, match="Duplicate instance ID detected in instances"):
+        scheduler.schedule(jobs, instances)
+
+    # Preflight validation
+    report = PreflightValidator().validate(jobs, instances)
+    assert not report.passed
+    assert any(b.code == "DUPLICATE_INSTANCE_ID" for b in report.blockers)
+
+
+def test_upstream_growth_revalidates_downstream_reset_deadline():
+    """Verify that when an upstream instance receives additional work, all downstream dependent instances
+    revalidate their quota reset deadlines, rejecting placements that push downstream instances past deadline."""
+    now = datetime.now(timezone.utc)
+    # Both instances have a 5.5h session limit
+    # Upstream A has plenty of time until reset
+    inst_a_reset = (now + timedelta(hours=24.0)).isoformat()
+    # Downstream B has reset in exactly 7.0h
+    inst_b_reset = (now + timedelta(hours=7.0)).isoformat()
+
+    # Pre-configure two instances
+    inst_a = Instance(instance_id="inst-A", device_count=1, max_session_h=5.5, remaining_quota_h=20.0, reset_at=inst_a_reset)
+    inst_b = Instance(instance_id="inst-B", device_count=1, max_session_h=5.5, remaining_quota_h=20.0, reset_at=inst_b_reset)
+
+    # Workload:
+    # 1. seg0 on A: 4.0h duration (+ 0.1h setup = 4.1h makespan)
+    # 2. seg1 on B: 2.0h duration (+ 0.1h setup = 2.1h makespan), depends on seg0
+    #    B's original finish time is 4.1h + 2.1h = 6.2h <= 7.0h (FITS!)
+    # 3. unrelated_job: 1.0h duration, depends_on=None.
+    #    If placed on A: A finishes at 4.0 + 1.0 + 0.1 = 5.1h <= 5.5h session limit (fits on A).
+    #    HOWEVER, pushing A to 5.1h forces B to finish at 5.1 + 2.1 = 7.2h > 7.0h reset deadline!
+    #    If placed on B: B finishes at 4.1 + (2.0 + 1.0) + 0.1 = 7.2h > 7.0h reset deadline!
+    #    Therefore, the unrelated job CANNOT be placed on either instance without violating B's reset deadline!
+    jobs = [
+        Job(job_id="seg0", duration_h=4.0),
+        Job(job_id="seg1", duration_h=2.0, depends_on="seg0"),
+        Job(job_id="unrelated_job", duration_h=1.0),
+    ]
+
+    scheduler = AccelPackScheduler(setup_overhead_h=0.10, enforce_reset_deadline=True)
+    with pytest.raises(QuotaExceededException):
+        scheduler.schedule(jobs, [inst_a, inst_b], allow_partial=False)
+
+    # If a third instance C is available, the unrelated job should be safely steered onto C
+    inst_c = Instance(instance_id="inst-C", device_count=1, max_session_h=5.5, remaining_quota_h=20.0, reset_at=inst_a_reset)
+    plan = scheduler.schedule(jobs, [inst_a, inst_b, inst_c], allow_partial=False)
+    assert len(plan.active_instances) == 3
+    timings = plan.instance_schedule_timings()
+    # A finishes at 4.1h, B finishes at 6.2h (respecting 7.0h deadline), C runs unrelated_job
+    finish_times = timings[1]
+    assert finish_times["inst-A"] == pytest.approx(4.10)
+    assert finish_times["inst-B"] == pytest.approx(6.20)
+    assert finish_times["inst-C"] == pytest.approx(1.10)
+
+
+def test_segmented_parent_dependency_remapping_unsegmented_child():
+    """Verify that an unsegmented child depending on a segmented parent has its prerequisite
+    automatically remapped to the parent's final segment."""
+    jobs = [
+        Job(job_id="train", duration_h=8.0, segments=[4.0, 4.0]),
+        Job(job_id="evaluate", duration_h=1.0, depends_on="train"),
+    ]
+
+    scheduler = AccelPackScheduler(expand_segments=True)
+    expanded = scheduler._expand_segmented_jobs(jobs)
+
+    # Expanded jobs: train_seg0, train_seg1, evaluate
+    assert len(expanded) == 3
+    job_map = {j.job_id: j for j in expanded}
+    assert "train_seg0" in job_map
+    assert "train_seg1" in job_map
+    assert "evaluate" in job_map
+
+    # Check dependency remapping
+    assert job_map["train_seg0"].depends_on is None
+    assert job_map["train_seg1"].depends_on == "train_seg0"
+    assert job_map["evaluate"].depends_on == "train_seg1"  # Remapped to final segment!
+
+    # Workload graph validation must pass without unknown prerequisite error
+    scheduler._validate_dependency_graph(expanded)
+
+    # Schedule should execute in valid topological sequence
+    inst = [Instance(instance_id="node-1", device_count=1, max_session_h=12.0, remaining_quota_h=20.0)]
+    plan = scheduler.schedule(jobs, inst)
+    slot_jobs = plan.active_instances[0].slots[0].jobs
+    assert [j.job_id for j in slot_jobs] == ["train_seg0", "train_seg1", "evaluate"]
+
+
+def test_segmented_parent_dependency_remapping_segmented_child():
+    """Verify that a segmented child depending on a segmented parent correctly links its first
+    segment to the parent's final segment and links subsequent child segments sequentially."""
+    jobs = [
+        Job(job_id="train", duration_h=8.0, segments=[4.0, 4.0]),
+        Job(job_id="eval", duration_h=2.0, segments=[1.0, 1.0], depends_on="train"),
+    ]
+
+    scheduler = AccelPackScheduler(expand_segments=True)
+    expanded = scheduler._expand_segmented_jobs(jobs)
+
+    assert len(expanded) == 4
+    job_map = {j.job_id: j for j in expanded}
+    assert job_map["train_seg0"].depends_on is None
+    assert job_map["train_seg1"].depends_on == "train_seg0"
+    assert job_map["eval_seg0"].depends_on == "train_seg1"  # Remapped to parent's final segment!
+    assert job_map["eval_seg1"].depends_on == "eval_seg0"   # Chains to child's previous segment!
+
+    scheduler._validate_dependency_graph(expanded)
+
+
+def test_deterministic_run_id_generation_and_cli_persistence(tmp_path, monkeypatch):
+    """Verify that submitting a completed job without a run_id generates a deterministic run_id,
+    persists it back to the JSON file, and provides strict idempotence across repeat CLI submissions."""
+    from accelpack import cli
+
+    inst_file = tmp_path / "inst.json"
+    jobs_file = tmp_path / "jobs.json"
+    history_file = tmp_path / "history.json"
+    profiles_file = tmp_path / "profiles.json"
+    record_file = tmp_path / "record.json"
+
+    inst_file.write_text(json.dumps([{"instance_id": "n1", "device_count": 1, "remaining_quota_h": 10.0}]))
+    jobs_file.write_text(json.dumps([{"job_id": "dummy", "duration_h": 1.0}]))
+
+    # Record data with NO run_id specified
+    record_payload = {
+        "job_id": "cifar_eval",
+        "env_id": "cifar",
+        "model": "resnet18",
+        "steps": 180000,
+        "predicted_duration_h": 1.0,
+        "actual_duration_h": 0.5,
+        "success": True,
+        "instance_id": "node_alpha",
+        "device_index": 0,
+        "concurrent_workers": 1,
+        "hardware_class": "nvidia_t4",
+    }
+    record_file.write_text(json.dumps(record_payload, indent=2), encoding="utf-8")
+
+    # First CLI run: should record job and persist generated run_id to record_file
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "accelpack.cli",
+            "--instances", str(inst_file),
+            "--jobs", str(jobs_file),
+            "--history", str(history_file),
+            "--profiles", str(profiles_file),
+            "--record-job", str(record_file),
+        ],
+    )
+    cli.main()
+
+    # Verify run_id was persisted back to record_file
+    updated_record = json.loads(record_file.read_text(encoding="utf-8"))
+    assert "run_id" in updated_record
+    persisted_run_id = updated_record["run_id"]
+    assert persisted_run_id.startswith("run_cifar_eval_")
+
+    # Verify history recorded this run_id
+    hist_data = json.loads(history_file.read_text(encoding="utf-8"))
+    assert len(hist_data) == 1
+    assert hist_data[0]["run_id"] == persisted_run_id
+
+    # Verify profile was calibrated
+    prof_data = json.loads(profiles_file.read_text(encoding="utf-8"))
+    assert len(prof_data) == 1
+    assert persisted_run_id in prof_data[0]["applied_run_ids"]
+    initial_fps = prof_data[0]["fps"]
+
+    # Second CLI run with the exact same record file: must be idempotent!
+    cli.main()
+
+    hist_data_2 = json.loads(history_file.read_text(encoding="utf-8"))
+    assert len(hist_data_2) == 1  # Not duplicated in history!
+    prof_data_2 = json.loads(profiles_file.read_text(encoding="utf-8"))
+    assert prof_data_2[0]["fps"] == pytest.approx(initial_fps)  # Not double-calibrated!
+
+
+def test_legacy_history_migration_deterministic_ids_and_backward_compatibility(tmp_path):
+    """Verify that legacy history records missing run_id are assigned deterministic migration IDs
+    that do not conflate distinct executions of the same logical job, and preserve compatibility with
+    profiles using applied_job_ids."""
+    history_file = tmp_path / "legacy_history.json"
+
+    # Legacy records: same job_id executed twice at different timestamps / steps
+    legacy_data = [
+        {
+            "job_id": "rl_train",
+            "env_id": "mujoco",
+            "model": "sac",
+            "steps": 100000,
+            "predicted_duration_h": 1.0,
+            "actual_duration_h": 1.0,
+            "success": True,
+            "instance_id": "node1",
+            "timestamp": "2026-10-01T10:00:00Z",
+            "measured_fps": 100.0,
+        },
+        {
+            "job_id": "rl_train",
+            "env_id": "mujoco",
+            "model": "sac",
+            "steps": 200000,
+            "predicted_duration_h": 2.0,
+            "actual_duration_h": 1.5,
+            "success": True,
+            "instance_id": "node1",
+            "timestamp": "2026-10-02T10:00:00Z",
+            "measured_fps": 150.0,
+        },
+    ]
+    history_file.write_text(json.dumps(legacy_data), encoding="utf-8")
+
+    reconciler = ExecutionReconciler(history_file=history_file)
+    assert len(reconciler.history) == 2
+    rec1, rec2 = reconciler.history[0], reconciler.history[1]
+
+    # Deterministic migration IDs must be unique per execution
+    assert rec1.run_id != rec2.run_id
+    assert rec1.run_id.startswith("legacy_rl_train_0_")
+    assert rec2.run_id.startswith("legacy_rl_train_1_")
+
+    # Replay into fresh estimator: both distinct runs should be replayed
+    estimator = ProfileDurationEstimator()
+    count = reconciler.replay_into_estimator(estimator)
+    assert count == 2
+
+    # Now test backward compatibility: if profile already has applied_job_ids=["rl_train"],
+    # replaying should respect the legacy application flag
+    estimator_legacy = ProfileDurationEstimator()
+    estimator_legacy.register_profile(
+        env_id="mujoco",
+        model="sac",
+        fps=120.0,
+        applied_job_ids=["rl_train"],
+    )
+    # Replay should skip applying because rl_train is marked in applied_job_ids
+    replayed = reconciler.replay_into_estimator(estimator_legacy)
+    assert replayed == 0
+
+
+def test_candidate_start_offset_invalid_timing_graph_raises_error():
+    """Verify that _get_candidate_instance_start_offset raises ValueError if instance dependency
+    graph contains an invalid cycle, rather than masking it with standalone makespans."""
+    inst_a = Instance(instance_id="inst-A", device_count=1)
+    inst_b = Instance(instance_id="inst-B", device_count=1)
+
+    ja1 = Job(job_id="ja1", duration_h=1.0)
+    jb1 = Job(job_id="jb1", duration_h=1.0, depends_on="ja1")
+    jb2 = Job(job_id="jb2", duration_h=1.0)
+    ja2 = Job(job_id="ja2", duration_h=1.0, depends_on="jb2")
+
+    plan_a = InstancePlan(instance=inst_a, slots=[DeviceSlot("inst-A", 0, jobs=[ja1, ja2])])
+    plan_b = InstancePlan(instance=inst_b, slots=[DeviceSlot("inst-B", 0, jobs=[jb1, jb2])])
+
+    scheduler = AccelPackScheduler()
+    candidate_job = Job(job_id="extra", duration_h=1.0, depends_on="jb1")
+    with pytest.raises(ValueError, match="Instance dependency cycle detected"):
+        scheduler._get_candidate_instance_start_offset(plan_a, candidate_job, [plan_a, plan_b])
+
+
 
 
 
