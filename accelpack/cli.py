@@ -102,6 +102,27 @@ def main() -> int:
         help="Reject scheduling if instances sharing an account declare conflicting quotas",
     )
     parser.add_argument("--no-expand-segments", action="store_true", help="Disable automatic expansion of segmented jobs")
+    parser.add_argument(
+        "--allow-tail-overdraft",
+        action="store_true",
+        help="Permit final account session to overdraft up to max_session_h if positive quota remained at launch",
+    )
+    parser.add_argument(
+        "--schedule-across-reset",
+        action="store_true",
+        help="Allow workloads to straddle quota reset boundary into replenished quota epoch",
+    )
+    parser.add_argument(
+        "--reset-replenished-quota",
+        type=float,
+        default=30.0,
+        help="Authoritative quota replenished at reset_at boundary (default: 30.0h)",
+    )
+    parser.add_argument(
+        "--auto-expand-sessions",
+        action="store_true",
+        help="Automatically expand accounts with quota exceeding max_session_h into sequential sessions",
+    )
     parser.add_argument("--allow-partial", action="store_true", help="Allow partial scheduling without error")
     parser.add_argument("--skip-preflight", action="store_true", help="Skip preflight validation")
     parser.add_argument("--ignore-blockers", action="store_true", help="Proceed with scheduling even if preflight has blockers")
@@ -346,6 +367,9 @@ def main() -> int:
             enforce_reset_deadline=args.enforce_reset_deadline,
             strict_account_quotas=args.reject_conflicting_quotas,
             allow_segmented_jobs=not args.no_expand_segments,
+            allow_tail_overdraft=args.allow_tail_overdraft,
+            schedule_across_reset=args.schedule_across_reset,
+            reset_replenished_quota_h=args.reset_replenished_quota,
         )
         report = validator.validate(jobs, instances)
         print(report.format_text())
@@ -366,6 +390,10 @@ def main() -> int:
         enforce_reset_deadline=args.enforce_reset_deadline,
         reject_conflicting_account_quotas=args.reject_conflicting_quotas,
         expand_segments=not args.no_expand_segments,
+        allow_tail_overdraft=args.allow_tail_overdraft,
+        schedule_across_reset=args.schedule_across_reset,
+        reset_replenished_quota_h=args.reset_replenished_quota,
+        auto_expand_sessions=args.auto_expand_sessions,
     )
 
     try:
@@ -388,6 +416,7 @@ def main() -> int:
             "quota_productivity_ratio": plan.quota_productivity_ratio,
             "account_billed_quota": plan.account_billed_quota(),
             "account_remaining_quota": acct_rem_map,
+            "account_overdraft_quota": plan.account_overdraft_quota(),
             "instances": [
                 {
                     "instance_id": ip.instance.instance_id,

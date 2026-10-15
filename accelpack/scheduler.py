@@ -42,6 +42,10 @@ class AccelPackScheduler:
         enforce_reset_deadline: bool = False,
         reject_conflicting_account_quotas: bool = False,
         expand_segments: bool = True,
+        allow_tail_overdraft: bool = False,
+        schedule_across_reset: bool = False,
+        reset_replenished_quota_h: float = 30.0,
+        auto_expand_sessions: bool = False,
     ):
         """
         Args:
@@ -60,6 +64,13 @@ class AccelPackScheduler:
             reject_conflicting_account_quotas: If True, raise exception when instances sharing an account_id
                                               declare conflicting remaining quotas. If False, normalize to min().
             expand_segments: If True, split jobs declaring valid checkpoint segments into schedulable sub-jobs.
+            allow_tail_overdraft: If True, permit the final account session to overdraft up to max_session_h
+                                  as long as remaining quota was positive at container launch time.
+            schedule_across_reset: If True, model two-epoch execution across reset_at boundary, debiting pre-reset
+                                   and post-reset duration against pre-quota and replenished quota pools.
+            reset_replenished_quota_h: Authoritative quota replenished at reset_at boundary (default: 30.0h).
+            auto_expand_sessions: If True, automatically expand accounts whose usable quota exceeds max_session_h
+                                  into sequential chained sessions.
         """
         self.strategy = strategy
         self.objective = objective
@@ -74,6 +85,10 @@ class AccelPackScheduler:
         self.enforce_reset_deadline = enforce_reset_deadline
         self.reject_conflicting_account_quotas = reject_conflicting_account_quotas
         self.expand_segments = expand_segments
+        self.allow_tail_overdraft = allow_tail_overdraft
+        self.schedule_across_reset = schedule_across_reset
+        self.reset_replenished_quota_h = reset_replenished_quota_h
+        self.auto_expand_sessions = auto_expand_sessions
 
     def _normalize_account_quotas(self, instances: List[Instance]) -> List[Instance]:
         """Ensures every account pool has exactly one authoritative quota balance."""
@@ -101,6 +116,54 @@ class AccelPackScheduler:
                 normalized.append(inst_copy)
 
         return normalized
+
+    def _expand_account_sessions(self, instances: List[Instance]) -> List[Instance]:
+        """Expands instances belonging to accounts whose usable quota exceeds max_session_h
+        into sequential sessions with explicit inter-session dependencies."""
+        account_groups: Dict[str, List[Instance]] = {}
+        for inst in instances:
+            acc_id = inst.account_id or inst.instance_id
+            account_groups.setdefault(acc_id, []).append(inst)
+
+        expanded_instances: List[Instance] = []
+        for acc_id, inst_list in account_groups.items():
+            if len(inst_list) > 1:
+                # Account already contains multiple declared instances/sessions
+                expanded_instances.extend(inst_list)
+                continue
+
+            inst = inst_list[0]
+            session_limit = self.max_session_h if self.max_session_h is not None else inst.max_session_h
+
+            # Calculate total usable quota for sizing sessions
+            total_cap = inst.remaining_quota_h
+            if self.allow_tail_overdraft:
+                total_cap += session_limit * inst.debit_rate
+            if self.schedule_across_reset:
+                total_cap += self.reset_replenished_quota_h
+
+            if total_cap <= session_limit:
+                expanded_instances.append(inst)
+                continue
+
+            num_sessions = math.ceil(total_cap / max(0.1, session_limit))
+            # Bound expansion reasonably (e.g. at most 16 sessions)
+            num_sessions = min(num_sessions, 16)
+
+            for s in range(num_sessions):
+                session_inst = copy.deepcopy(inst)
+                session_inst.instance_id = f"{inst.instance_id}_s{s}"
+                session_inst.account_id = acc_id
+                session_inst.metadata = {
+                    **session_inst.metadata,
+                    "session_index": s,
+                    "parent_instance_id": inst.instance_id,
+                }
+                if s > 0:
+                    session_inst.metadata["prereq_instance_id"] = f"{inst.instance_id}_s{s - 1}"
+                expanded_instances.append(session_inst)
+
+        return expanded_instances
 
     def _expand_segmented_jobs(self, jobs: List[Job]) -> List[Job]:
         """Expands jobs with checkpoint segments into schedulable discrete segment units with explicit dependencies,
@@ -271,6 +334,9 @@ class AccelPackScheduler:
                         p_id = job_to_inst[j.depends_on]
                         if p_id != i_id:
                             graph[i_id].add(p_id)
+            prereq_iid = ip.instance.metadata.get("prereq_instance_id")
+            if prereq_iid:
+                graph[i_id].add(prereq_iid)
 
         # A cycle would occur if candidate_inst_id is already reachable from prereq_inst_id
         visited: Set[str] = set()
@@ -304,9 +370,6 @@ class AccelPackScheduler:
         if candidate_job.depends_on:
             prereq_job_ids.add(candidate_job.depends_on)
 
-        if not prereq_job_ids:
-            return 0.0
-
         # Map each job to its host instance_id in all_plans
         job_to_inst: Dict[str, str] = {}
         for ip in all_plans:
@@ -321,6 +384,10 @@ class AccelPackScheduler:
                 p_inst = job_to_inst[p_jid]
                 if p_inst != candidate_id:
                     external_prereq_inst_ids.add(p_inst)
+
+        prereq_iid = candidate_ip.instance.metadata.get("prereq_instance_id")
+        if prereq_iid and prereq_iid != candidate_id:
+            external_prereq_inst_ids.add(prereq_iid)
 
         if not external_prereq_inst_ids:
             return 0.0
@@ -351,6 +418,8 @@ class AccelPackScheduler:
 
         # 1. Authoritative account quota normalization
         normalized_instances = self._normalize_account_quotas(instances)
+        if self.auto_expand_sessions:
+            normalized_instances = self._expand_account_sessions(normalized_instances)
 
         # 2. Validate instance ID uniqueness
         inst_id_counts = collections.Counter(inst.instance_id for inst in instances)
@@ -520,9 +589,14 @@ class AccelPackScheduler:
             now_dt = datetime.now(timezone.utc)
             hours_to_reset = (reset_dt - now_dt).total_seconds() / 3600.0
 
-            # If reset timestamp has already passed, quota is stale -> Fail safe
+            # If reset timestamp has already passed, quota is stale -> Fail safe (unless schedule_across_reset and not must_finish_before_reset)
             if hours_to_reset <= 0:
+                if self.schedule_across_reset and not inst.must_finish_before_reset:
+                    return True
                 return False
+
+            if self.schedule_across_reset and not inst.must_finish_before_reset:
+                return True
 
             # Planned finish offset must not cross the deadline
             if finish_offset_h > hours_to_reset:
@@ -588,6 +662,117 @@ class AccelPackScheduler:
                     f"violates quota reset deadline. Reset timestamp is '{inst.reset_at}'."
                 )
 
+    def _check_quota_feasibility(
+        self,
+        candidate_ip: InstancePlan,
+        hyp_billed: float,
+        hyp_makespan: float,
+        all_plans: List[InstancePlan],
+        candidate_job: Job,
+    ) -> Tuple[bool, float]:
+        """Evaluates quota feasibility for placing candidate_job on candidate_ip,
+        supporting tail-session overdraft and reset-boundary straddling."""
+        inst = candidate_ip.instance
+        acc_id = self._get_account_id(inst)
+        session_limit = self.max_session_h if self.max_session_h is not None else inst.max_session_h
+
+        if self.schedule_across_reset and inst.reset_at:
+            try:
+                reset_dt = datetime.fromisoformat(inst.reset_at.replace("Z", "+00:00"))
+                now_dt = datetime.now(timezone.utc)
+                hours_to_reset = max(0.0, (reset_dt - now_dt).total_seconds() / 3600.0)
+            except Exception:
+                hours_to_reset = None
+
+            if hours_to_reset is not None:
+                active_instances = [p for p in all_plans if p.is_active]
+                start_times = {}
+                if active_instances:
+                    try:
+                        start_times, _ = ExecutionPlan(instance_plans=active_instances).instance_schedule_timings()
+                    except ValueError:
+                        start_times = {}
+
+                cand_start = self._get_candidate_instance_start_offset(candidate_ip, candidate_job, all_plans)
+                cand_finish = cand_start + hyp_makespan
+                cand_pre_dur = max(0.0, min(cand_finish, hours_to_reset) - min(cand_start, hours_to_reset))
+                cand_post_dur = max(0.0, max(cand_finish, hours_to_reset) - max(cand_start, hours_to_reset))
+                cand_pre_billed = cand_pre_dur * inst.debit_rate
+                cand_post_billed = cand_post_dur * inst.debit_rate
+
+                other_pre_billed = 0.0
+                other_post_billed = 0.0
+                for other_ip in all_plans:
+                    if other_ip is not candidate_ip and self._get_account_id(other_ip.instance) == acc_id and other_ip.is_active:
+                        other_start = start_times.get(other_ip.instance.instance_id, 0.0)
+                        other_finish = other_start + other_ip.makespan_h
+                        o_pre = max(0.0, min(other_finish, hours_to_reset) - min(other_start, hours_to_reset))
+                        o_post = max(0.0, max(other_finish, hours_to_reset) - max(other_start, hours_to_reset))
+                        other_pre_billed += o_pre * other_ip.instance.debit_rate
+                        other_post_billed += o_post * other_ip.instance.debit_rate
+
+                total_pre = other_pre_billed + cand_pre_billed
+                total_post = other_post_billed + cand_post_billed
+
+                pre_quota = inst.remaining_quota_h
+                post_quota = self.reset_replenished_quota_h
+
+                pre_ok = False
+                if cand_pre_dur <= 1e-6:
+                    pre_ok = True
+                elif (pre_quota - total_pre) >= (self.quota_buffer_h - 1e-6):
+                    pre_ok = True
+                elif self.allow_tail_overdraft:
+                    if (
+                        pre_quota > 1e-4
+                        and other_pre_billed < (pre_quota - 1e-4)
+                        and hyp_makespan <= (session_limit + 1e-6)
+                        and total_pre <= (pre_quota + (session_limit * inst.debit_rate) + 1e-6)
+                    ):
+                        pre_ok = True
+
+                post_ok = False
+                if cand_post_dur <= 1e-6:
+                    post_ok = True
+                elif (post_quota - total_post) >= (self.quota_buffer_h - 1e-6):
+                    post_ok = True
+                elif self.allow_tail_overdraft:
+                    if (
+                        post_quota > 1e-4
+                        and other_post_billed < (post_quota - 1e-4)
+                        and hyp_makespan <= (session_limit + 1e-6)
+                        and total_post <= (post_quota + (session_limit * inst.debit_rate) + 1e-6)
+                    ):
+                        post_ok = True
+
+                if pre_ok and post_ok:
+                    combined_rem = (pre_quota - total_pre) + (post_quota - total_post)
+                    return True, combined_rem
+                return False, 0.0
+
+        # Standard single-epoch accounting
+        other_inst_billed = sum(
+            other_ip.billed_resource_h
+            for other_ip in all_plans
+            if other_ip is not candidate_ip and self._get_account_id(other_ip.instance) == acc_id
+        )
+        total_acc_billed = other_inst_billed + hyp_billed
+        post_quota_rem = inst.remaining_quota_h - total_acc_billed
+
+        if post_quota_rem >= (self.quota_buffer_h - 1e-6):
+            return True, post_quota_rem
+
+        if self.allow_tail_overdraft:
+            if (
+                inst.remaining_quota_h > 1e-4
+                and other_inst_billed < (inst.remaining_quota_h - 1e-4)
+                and hyp_makespan <= (session_limit + 1e-6)
+                and total_acc_billed <= (inst.remaining_quota_h + (session_limit * inst.debit_rate) + 1e-6)
+            ):
+                return True, post_quota_rem
+
+        return False, post_quota_rem
+
     def _pack_balance_waterfill(
         self,
         sorted_jobs: List[Job],
@@ -635,16 +820,10 @@ class AccelPackScheduler:
                         continue
 
                     # Check account-level shared quota buffer against authoritative pool
-                    acc_id = self._get_account_id(inst)
-                    other_inst_billed = sum(
-                        other_ip.billed_resource_h
-                        for other_ip in instance_plans
-                        if other_ip is not ip and self._get_account_id(other_ip.instance) == acc_id
+                    is_feasible, post_quota_rem = self._check_quota_feasibility(
+                        ip, hyp_billed, hyp_makespan, instance_plans, job
                     )
-                    total_acc_billed = other_inst_billed + hyp_billed
-                    post_quota_rem = inst.remaining_quota_h - total_acc_billed
-
-                    if post_quota_rem < self.quota_buffer_h:
+                    if not is_feasible:
                         continue
 
                     # Scoring based on ObjectiveMode
@@ -744,16 +923,10 @@ class AccelPackScheduler:
                     if not self._check_hypothetical_placement_deadlines(ip, slot, job, active_plans):
                         continue
 
-                    acc_id = self._get_account_id(inst)
-                    other_inst_billed = sum(
-                        other_ip.billed_resource_h
-                        for other_ip in active_plans
-                        if other_ip is not ip and self._get_account_id(other_ip.instance) == acc_id
+                    is_feasible, post_quota_rem = self._check_quota_feasibility(
+                        ip, hyp_billed, hyp_makespan, active_plans, job
                     )
-                    total_acc_billed = other_inst_billed + hyp_billed
-                    post_quota_rem = inst.remaining_quota_h - total_acc_billed
-
-                    if post_quota_rem < self.quota_buffer_h:
+                    if not is_feasible:
                         continue
 
                     norm_slot_load = slot.load_h / max(1.0, session_limit)

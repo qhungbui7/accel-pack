@@ -2659,6 +2659,281 @@ def test_cli_exit_codes_matrix(tmp_path, monkeypatch):
     assert cli.main() == cli.EXIT_SCHEDULING_ERROR
 
 
+def test_tail_overdraft_packs_over_40h_on_single_30h_account():
+    """Verify that --allow-tail-overdraft permits a 30h quota account to run >40h of execution
+    via sequential session chaining when positive quota remains before launching the final session."""
+    # Account with 30.0h quota and 11.0h max session container limit
+    inst = Instance(instance_id="k1_acc", remaining_quota_h=30.0, max_session_h=11.0, device_count=1)
+
+    # 4 jobs totaling 40.2 worker-hours: 3 jobs of 9.8h (29.4h within quota), then 1 job of 10.8h (tail overdraft)
+    jobs = [
+        Job(job_id="job_0", duration_h=9.8),
+        Job(job_id="job_1", duration_h=9.8, depends_on="job_0"),
+        Job(job_id="job_2", duration_h=9.8, depends_on="job_1"),
+        Job(job_id="job_3", duration_h=10.8, depends_on="job_2"),
+    ]
+
+    # 1. Under default settings (allow_tail_overdraft=False): 40.2h cannot fit in 30h quota
+    sched_strict = AccelPackScheduler(setup_overhead_h=0.0, quota_buffer_h=2.0, auto_expand_sessions=True)
+    with pytest.raises(QuotaExceededException):
+        sched_strict.schedule(jobs, [inst], allow_partial=False)
+
+    # 2. With allow_tail_overdraft=True: sessions 0, 1, 2 consume 29.4h (0.6h quota left), and session 3 overdrafts by 10.2h!
+    sched_overdraft = AccelPackScheduler(
+        setup_overhead_h=0.0,
+        quota_buffer_h=2.0,
+        allow_tail_overdraft=True,
+        auto_expand_sessions=True,
+    )
+    plan = sched_overdraft.schedule(jobs, [inst], allow_partial=False)
+
+    assert len(plan.unassigned_jobs) == 0
+    assert plan.total_work_h == pytest.approx(40.2)
+    assert plan.total_billed_resource_h == pytest.approx(40.2)
+    assert plan.global_makespan_h == pytest.approx(40.2)
+    assert len(plan.active_instances) == 4
+
+    # Account quota accounting
+    assert plan.account_remaining_quota()["k1_acc"] == 0.0
+    assert plan.account_overdraft_quota()["k1_acc"] == pytest.approx(10.2)
+
+    # Inter-session sequential timing verification
+    start_times, finish_times = plan.instance_schedule_timings()
+    active_ids = [ip.instance.instance_id for ip in plan.active_instances]
+    assert active_ids == ["k1_acc_s0", "k1_acc_s1", "k1_acc_s2", "k1_acc_s3"]
+
+    assert start_times["k1_acc_s0"] == 0.0
+    assert finish_times["k1_acc_s0"] == pytest.approx(9.8)
+    assert start_times["k1_acc_s1"] == pytest.approx(9.8)
+    assert finish_times["k1_acc_s1"] == pytest.approx(19.6)
+    assert start_times["k1_acc_s2"] == pytest.approx(19.6)
+    assert finish_times["k1_acc_s2"] == pytest.approx(29.4)
+    assert start_times["k1_acc_s3"] == pytest.approx(29.4)
+    assert finish_times["k1_acc_s3"] == pytest.approx(40.2)
+
+    # Summary text displays tail overdraft note
+    summary = plan.summary()
+    assert "(+10.20h Tail Overdraft)" in summary or "(+10.20h Overdraft)" in summary
+
+
+def test_tail_overdraft_launch_gate_positive_quota_required():
+    """Verify that tail overdraft can only launch if the account had positive quota at launch time."""
+    # Account with only 0.5h remaining quota
+    inst_low = Instance(instance_id="k_low", remaining_quota_h=0.5, max_session_h=11.0, device_count=1)
+    j_10h = Job(job_id="job_long", duration_h=10.0)
+
+    # With allow_tail_overdraft, 0.5h > 0 allows launching 10h session
+    sched = AccelPackScheduler(setup_overhead_h=0.0, allow_tail_overdraft=True)
+    plan = sched.schedule([j_10h], [inst_low])
+    assert len(plan.active_instances) == 1
+    assert plan.total_billed_resource_h == pytest.approx(10.0)
+    assert plan.account_overdraft_quota()["k_low"] == pytest.approx(9.5)
+
+    # If account starts with 0.0h quota: cannot launch even with allow_tail_overdraft
+    inst_zero = Instance(instance_id="k_zero", remaining_quota_h=0.0, max_session_h=11.0, device_count=1)
+    with pytest.raises(QuotaExceededException):
+        sched.schedule([j_10h], [inst_zero])
+
+
+def test_reset_straddling_schedules_across_quota_replenishment():
+    """Verify that --schedule-across-reset models pre-reset and replenished post-reset quota pools
+    to execute across the reset boundary."""
+    # Reset is 6.0 hours from now
+    now_dt = datetime.now(timezone.utc)
+    reset_dt = now_dt + timedelta(hours=6.0)
+    reset_str = reset_dt.isoformat()
+
+    # Account has 8.0h pre-reset quota, resets to 30.0h at reset_str
+    inst = Instance(
+        instance_id="k_straddle",
+        remaining_quota_h=8.0,
+        max_session_h=11.0,
+        reset_at=reset_str,
+        device_count=1,
+    )
+
+    # 4 jobs: Job 0 (9.0h -> 6h pre, 3h post), Job 1 (9.0h), Job 2 (9.0h), Job 3 (8.0h)
+    # Pre-reset billed = 6.0h (within 8.0h quota, leaves 2.0h >= 1.0h buffer)
+    # Post-reset billed = 3.0 + 9.0 + 9.0 + 8.0 = 29.0h (within 30.0h quota, leaves 1.0h >= 1.0h buffer)
+    # Total work = 35.0h
+    jobs = [
+        Job(job_id="job_0", duration_h=9.0),
+        Job(job_id="job_1", duration_h=9.0, depends_on="job_0"),
+        Job(job_id="job_2", duration_h=9.0, depends_on="job_1"),
+        Job(job_id="job_3", duration_h=8.0, depends_on="job_2"),
+    ]
+
+    # 1. Without schedule_across_reset: 35h fails against 8.0h quota & 6.0h deadline
+    sched_strict = AccelPackScheduler(
+        setup_overhead_h=0.0,
+        enforce_reset_deadline=True,
+        auto_expand_sessions=True,
+    )
+    with pytest.raises(QuotaExceededException):
+        sched_strict.schedule(jobs, [inst])
+
+    # 2. With schedule_across_reset=True:
+    # Pre-reset executes within 8.0h quota; post-reset executes using replenished 30.0h quota!
+    sched_straddle = AccelPackScheduler(
+        setup_overhead_h=0.0,
+        quota_buffer_h=1.0,
+        schedule_across_reset=True,
+        reset_replenished_quota_h=30.0,
+        auto_expand_sessions=True,
+    )
+    plan = sched_straddle.schedule(jobs, [inst])
+
+    assert len(plan.unassigned_jobs) == 0
+    assert plan.total_work_h == pytest.approx(35.0)
+    assert plan.total_billed_resource_h == pytest.approx(35.0)
+    assert plan.global_makespan_h == pytest.approx(35.0)
+
+
+def test_combined_overdraft_and_reset_straddling_exceeds_40h():
+    """Verify combined allow_tail_overdraft and schedule_across_reset achieves over 40h across reset boundary."""
+    now_dt = datetime.now(timezone.utc)
+    reset_dt = now_dt + timedelta(hours=8.0)
+    reset_str = reset_dt.isoformat()
+
+    inst = Instance(
+        instance_id="k_mega",
+        remaining_quota_h=10.0,
+        max_session_h=11.0,
+        reset_at=reset_str,
+        device_count=1,
+    )
+
+    # 4 jobs of 10.5h = 42.0h total
+    jobs = [Job(job_id=f"j_{i}", duration_h=10.5) for i in range(4)]
+
+    sched = AccelPackScheduler(
+        setup_overhead_h=0.0,
+        quota_buffer_h=1.0,
+        allow_tail_overdraft=True,
+        schedule_across_reset=True,
+        reset_replenished_quota_h=30.0,
+        auto_expand_sessions=True,
+    )
+    plan = sched.schedule(jobs, [inst])
+
+    assert len(plan.unassigned_jobs) == 0
+    assert plan.total_work_h == pytest.approx(42.0)
+    assert plan.total_billed_resource_h == pytest.approx(42.0)
+    assert plan.global_makespan_h == pytest.approx(42.0)
+
+
+def test_cli_overdraft_and_auto_expand_export(tmp_path, monkeypatch):
+    """Verify CLI interface with --allow-tail-overdraft and --auto-expand-sessions exports overdraft metrics."""
+    inst_file = tmp_path / "instances.json"
+    inst_file.write_text(json.dumps([{
+        "instance_id": "cli_acc",
+        "device_count": 1,
+        "remaining_quota_h": 15.0,
+        "max_session_h": 11.0,
+    }]))
+
+    # 2 jobs of 9.0h = 18.0h (15h quota + 3h overdraft)
+    jobs_file = tmp_path / "jobs.json"
+    jobs_file.write_text(json.dumps([
+        {"job_id": "j1", "duration_h": 9.0},
+        {"job_id": "j2", "duration_h": 9.0},
+    ]))
+
+    out_file = tmp_path / "plan.json"
+
+    monkeypatch.setattr("sys.argv", [
+        "accelpack.cli",
+        "--instances", str(inst_file),
+        "--jobs", str(jobs_file),
+        "--setup-overhead", "0.0",
+        "--quota-buffer", "0.0",
+        "--allow-tail-overdraft",
+        "--auto-expand-sessions",
+        "--output", str(out_file),
+    ])
+
+    exit_code = cli.main()
+    assert exit_code == cli.EXIT_SUCCESS
+
+    data = json.loads(out_file.read_text(encoding="utf-8"))
+    assert data["total_billed_resource_h"] == pytest.approx(18.0)
+    assert "account_overdraft_quota" in data
+    assert data["account_overdraft_quota"]["cli_acc"] == pytest.approx(3.0)
+    assert len(data["instances"]) == 2
+
+
+def test_multi_account_fleet_parallel_auto_expansion():
+    """Verify that multiple independent accounts expand into separate session chains
+    running in parallel across accounts while serializing within each account."""
+    inst1 = Instance(instance_id="acc1_node", account_id="acc1", remaining_quota_h=20.0, max_session_h=10.0, device_count=1, hardware_class="nvidia_t4")
+    inst2 = Instance(instance_id="acc2_node", account_id="acc2", remaining_quota_h=20.0, max_session_h=10.0, device_count=1, hardware_class="nvidia_p100")
+
+    # 4 jobs of 10.0h each across two distinct hardware target pipelines
+    jobs = [
+        Job(job_id="j1_a", duration_h=10.0, hardware_class="nvidia_t4"),
+        Job(job_id="j1_b", duration_h=10.0, depends_on="j1_a", hardware_class="nvidia_t4"),
+        Job(job_id="j2_a", duration_h=10.0, hardware_class="nvidia_p100"),
+        Job(job_id="j2_b", duration_h=10.0, depends_on="j2_a", hardware_class="nvidia_p100"),
+    ]
+
+    sched = AccelPackScheduler(setup_overhead_h=0.0, quota_buffer_h=0.0, auto_expand_sessions=True)
+    plan = sched.schedule(jobs, [inst1, inst2])
+
+    assert len(plan.unassigned_jobs) == 0
+    assert plan.total_work_h == pytest.approx(40.0)
+    assert len(plan.active_instances) == 4
+
+    start_times, finish_times = plan.instance_schedule_timings()
+
+    # Sessions across acc1 and acc2 start at t=0.0 in parallel
+    root_sessions = [iid for iid, t in start_times.items() if t == 0.0]
+    assert len(root_sessions) == 2
+    assert "acc1_node_s0" in root_sessions
+    assert "acc2_node_s0" in root_sessions
+
+    # Chained sessions within each account start at t=10.0
+    assert start_times["acc1_node_s1"] == pytest.approx(10.0)
+    assert start_times["acc2_node_s1"] == pytest.approx(10.0)
+
+    # Global elapsed makespan is 20.0h (two parallel 20h pipelines)
+    assert plan.global_makespan_h == pytest.approx(20.0)
+
+
+def test_concentrate_packing_strategy_with_overdraft():
+    """Verify PackingStrategy.CONCENTRATE uses minimal accounts and successfully leverages tail overdraft."""
+    inst1 = Instance(instance_id="node_primary", remaining_quota_h=15.0, max_session_h=10.0, device_count=1)
+    inst2 = Instance(instance_id="node_backup", remaining_quota_h=15.0, max_session_h=10.0, device_count=1)
+
+    # 2 jobs of 9.0h = 18.0h total
+    jobs = [
+        Job(job_id="j_a", duration_h=9.0),
+        Job(job_id="j_b", duration_h=9.0, depends_on="j_a"),
+    ]
+
+    # Under CONCENTRATE with allow_tail_overdraft=True and auto_expand_sessions=True:
+    # 18.0h fits on node_primary alone (15h quota + 3h overdraft across 2 sessions)
+    # node_backup should be left untouched!
+    sched = AccelPackScheduler(
+        strategy=PackingStrategy.CONCENTRATE,
+        setup_overhead_h=0.0,
+        quota_buffer_h=0.0,
+        allow_tail_overdraft=True,
+        auto_expand_sessions=True,
+    )
+    plan = sched.schedule(jobs, [inst1, inst2])
+
+    assert len(plan.unassigned_jobs) == 0
+    active_inst_ids = [ip.instance.instance_id for ip in plan.active_instances]
+    # Only sessions belonging to node_primary are active
+    assert all("node_primary" in iid for iid in active_inst_ids)
+    # node_backup is completely untouched
+    untouched_ids = [ip.instance.instance_id for ip in plan.untouched_instances]
+    assert any("node_backup" in iid for iid in untouched_ids)
+    assert plan.account_overdraft_quota()["node_primary"] == pytest.approx(3.0)
+
+
+
+
 
 
 

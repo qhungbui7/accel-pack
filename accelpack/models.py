@@ -353,6 +353,9 @@ class ExecutionPlan:
                         a_id = job_to_inst[j.depends_on]
                         if a_id != b_id:
                             inst_prereqs[b_id].add(a_id)
+            prereq_inst_id = ip.instance.metadata.get("prereq_instance_id")
+            if prereq_inst_id and prereq_inst_id in inst_prereqs:
+                inst_prereqs[b_id].add(prereq_inst_id)
 
         start_times: Dict[str, float] = {}
         finish_times: Dict[str, float] = {}
@@ -433,9 +436,19 @@ class ExecutionPlan:
             for acc_id, pool_quota in declared_pools.items()
         }
 
+    def account_overdraft_quota(self) -> Dict[str, float]:
+        """Aggregate overdraft quota hours (billed beyond declared quota), grouped by account_id."""
+        acct_billed = self.account_billed_quota()
+        declared_pools = self.account_declared_quota()
+        return {
+            acc_id: max(0.0, billed - declared_pools.get(acc_id, 0.0))
+            for acc_id, billed in acct_billed.items()
+        }
+
     def summary(self) -> str:
         start_times, finish_times = self.instance_schedule_timings()
         acct_rem_map = self.account_remaining_quota()
+        overdraft_map = self.account_overdraft_quota()
         lines = [
             "=" * 70,
             "ACCELPACK WORKLOAD SCHEDULE SUMMARY",
@@ -458,7 +471,8 @@ class ExecutionPlan:
             for acc_id, billed in acct_billed.items():
                 pool_quota = declared_pools.get(acc_id, 0.0)
                 rem_after = max(0.0, pool_quota - billed)
-                lines.append(f"  * Account [{acc_id}]: Billed {billed:.2f}h | Remaining After {rem_after:.2f}h / {pool_quota:.2f}h")
+                od_note = f" (+{overdraft_map[acc_id]:.2f}h Tail Overdraft)" if overdraft_map.get(acc_id, 0.0) > 0 else ""
+                lines.append(f"  * Account [{acc_id}]: Billed {billed:.2f}h | Remaining After {rem_after:.2f}h / {pool_quota:.2f}h{od_note}")
             lines.append("-" * 70)
 
         for ip in self.active_instances:
@@ -476,10 +490,11 @@ class ExecutionPlan:
                 cpu_status += " [OVERSUBSCRIBED - Soft Penalty Applied]"
 
             shared_quota_rem = acct_rem_map.get(acc_id, ip.quota_remaining_after_h)
+            od_note = f" (+{overdraft_map[acc_id]:.2f}h Overdraft)" if overdraft_map.get(acc_id, 0.0) > 0 else ""
             lines.append(
                 f"[{acc.instance_id} (Account: {acc.account_id})] {timing_info} | "
                 f"Billed: {ip.billed_resource_h:.2f}h | "
-                f"Account Quota Remaining: {shared_quota_rem:.2f}h | "
+                f"Account Quota Remaining: {shared_quota_rem:.2f}h{od_note} | "
                 f"Workers: {ip.peak_concurrent_workers}/{acc.max_concurrent_workers}"
             )
             lines.append(f"  CPU Demand: {cpu_status}")

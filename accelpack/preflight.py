@@ -68,6 +68,9 @@ class PreflightValidator:
         enforce_reset_deadline: bool = False,
         strict_account_quotas: bool = False,
         allow_segmented_jobs: bool = True,
+        allow_tail_overdraft: bool = False,
+        schedule_across_reset: bool = False,
+        reset_replenished_quota_h: float = 30.0,
     ):
         self.min_quota_buffer_h = min_quota_buffer_h
         self.max_session_overhead_ratio = max_session_overhead_ratio
@@ -75,6 +78,9 @@ class PreflightValidator:
         self.enforce_reset_deadline = enforce_reset_deadline
         self.strict_account_quotas = strict_account_quotas
         self.allow_segmented_jobs = allow_segmented_jobs
+        self.allow_tail_overdraft = allow_tail_overdraft
+        self.schedule_across_reset = schedule_across_reset
+        self.reset_replenished_quota_h = reset_replenished_quota_h
 
     def validate(
         self,
@@ -133,9 +139,15 @@ class PreflightValidator:
 
             account_quota = min(quotas)
             usable_q = max(0.0, account_quota - self.min_quota_buffer_h)
+            if self.allow_tail_overdraft:
+                max_sess = max(i.max_session_h for i in inst_list)
+                avg_debit = sum(i.debit_rate for i in inst_list) / len(inst_list)
+                usable_q += max_sess * avg_debit
+            if self.schedule_across_reset:
+                usable_q += self.reset_replenished_quota_h
             total_usable_quota += usable_q
 
-            if account_quota <= self.min_quota_buffer_h:
+            if account_quota <= self.min_quota_buffer_h and not self.allow_tail_overdraft and not self.schedule_across_reset:
                 issues.append(
                     PreflightIssue(
                         severity="WARNING",
@@ -148,7 +160,7 @@ class PreflightValidator:
 
         # Reset timestamp checks
         for inst in instances:
-            enforce_this_reset = self.enforce_reset_deadline or inst.must_finish_before_reset
+            enforce_this_reset = (self.enforce_reset_deadline or inst.must_finish_before_reset) and not (self.schedule_across_reset and not inst.must_finish_before_reset)
             if enforce_this_reset and not inst.reset_at:
                 issues.append(
                     PreflightIssue(
@@ -182,15 +194,26 @@ class PreflightValidator:
                             )
                         )
                     elif hours_to_reset < inst.max_session_h:
-                        issues.append(
-                            PreflightIssue(
-                                severity="INFO",
-                                code="SESSION_BOUNDED_BY_RESET",
-                                message=f"Time until quota reset ({hours_to_reset:.2f}h) is shorter than max session cap ({inst.max_session_h:.2f}h).",
-                                target_id=inst.instance_id,
-                                remediation="Ensure scheduled sessions fit within remaining hours before reset.",
+                        if self.schedule_across_reset and not inst.must_finish_before_reset:
+                            issues.append(
+                                PreflightIssue(
+                                    severity="INFO",
+                                    code="SESSION_STRADDLES_RESET",
+                                    message=f"Time until quota reset ({hours_to_reset:.2f}h) is shorter than max session cap ({inst.max_session_h:.2f}h). Sessions will straddle across reset into replenished quota.",
+                                    target_id=inst.instance_id,
+                                    remediation="Workloads will transition across the reset boundary using replenished quota.",
+                                )
                             )
-                        )
+                        else:
+                            issues.append(
+                                PreflightIssue(
+                                    severity="INFO",
+                                    code="SESSION_BOUNDED_BY_RESET",
+                                    message=f"Time until quota reset ({hours_to_reset:.2f}h) is shorter than max session cap ({inst.max_session_h:.2f}h).",
+                                    target_id=inst.instance_id,
+                                    remediation="Ensure scheduled sessions fit within remaining hours before reset.",
+                                )
+                            )
                 except Exception:
                     sev = "BLOCKER" if enforce_this_reset else "WARNING"
                     issues.append(
