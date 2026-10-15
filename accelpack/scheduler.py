@@ -136,6 +136,19 @@ class AccelPackScheduler:
                 expanded.append(j)
         return expanded
 
+    def _validate_dependency_graph(self, jobs: List[Job]) -> None:
+        """Validates that job dependencies form a valid DAG with known prerequisite IDs."""
+        job_ids = {j.job_id for j in jobs}
+        for j in jobs:
+            if j.depends_on is not None:
+                if j.depends_on == j.job_id:
+                    raise ValueError(f"Job '{j.job_id}' cannot depend on itself (self-dependency detected).")
+                if j.depends_on not in job_ids:
+                    raise ValueError(
+                        f"Job '{j.job_id}' depends on unknown prerequisite '{j.depends_on}' "
+                        f"which is not present in the workload."
+                    )
+
     def _order_jobs(self, jobs: List[Job]) -> List[Job]:
         """Orders jobs preserving prerequisite dependencies (depends_on) while applying
         objective-specific sorting among ready jobs."""
@@ -167,9 +180,11 @@ class AccelPackScheduler:
                     ready.append(dep)
 
         if len(ordered) < len(jobs):
-            for j in jobs:
-                if j not in ordered:
-                    ordered.append(j)
+            remaining_ids = [j.job_id for j in jobs if j not in ordered]
+            raise ValueError(
+                f"Circular dependency cycle detected among jobs: {remaining_ids}. "
+                f"Workload dependency graph must be a directed acyclic graph (DAG)."
+            )
 
         return ordered
 
@@ -208,6 +223,26 @@ class AccelPackScheduler:
 
         return True
 
+    def _get_prerequisite_finish_offset(
+        self,
+        job: Job,
+        candidate_ip: InstancePlan,
+        all_plans: List[InstancePlan],
+    ) -> float:
+        """Returns the elapsed wall-clock finish offset (in hours) of prerequisite job's instance,
+        or 0.0 if job has no prerequisite or prerequisite is co-located on candidate_ip."""
+        if not job.depends_on:
+            return 0.0
+
+        for ip in all_plans:
+            for s in ip.slots:
+                if any(j.job_id == job.depends_on for j in s.jobs):
+                    if ip.instance.instance_id == candidate_ip.instance.instance_id:
+                        return 0.0
+                    _, finish_times = ExecutionPlan(instance_plans=all_plans).instance_schedule_timings()
+                    return finish_times.get(ip.instance.instance_id, ip.makespan_h)
+        return 0.0
+
     def schedule(
         self,
         jobs: List[Job],
@@ -234,7 +269,10 @@ class AccelPackScheduler:
         # 2. Expand segmented jobs if enabled
         schedulable_jobs = self._expand_segmented_jobs(jobs)
 
-        # 3. Sort jobs topologically respecting dependencies and objective mode
+        # 3. Validate dependency graph (reject unknown prerequisite IDs, self-dependencies, and cycles)
+        self._validate_dependency_graph(schedulable_jobs)
+
+        # 4. Sort jobs topologically respecting dependencies and objective mode
         sorted_jobs = self._order_jobs(schedulable_jobs)
         total_work_h = sum(j.duration_h for j in sorted_jobs)
 
@@ -417,8 +455,10 @@ class AccelPackScheduler:
                     if hyp_makespan > session_limit:
                         continue
 
-                    # Check reset deadline safely
-                    if not self._check_reset_deadline(inst, hyp_makespan):
+                    # Check reset deadline safely against completion time relative to t=0
+                    prereq_offset = self._get_prerequisite_finish_offset(job, ip, instance_plans)
+                    hyp_finish_offset = prereq_offset + hyp_makespan
+                    if not self._check_reset_deadline(inst, hyp_finish_offset):
                         continue
 
                     # Check account-level shared quota buffer against authoritative pool
@@ -527,7 +567,10 @@ class AccelPackScheduler:
                     if hyp_makespan > session_limit:
                         continue
 
-                    if not self._check_reset_deadline(inst, hyp_makespan):
+                    # Check reset deadline safely against completion time relative to t=0
+                    prereq_offset = self._get_prerequisite_finish_offset(job, ip, active_plans)
+                    hyp_finish_offset = prereq_offset + hyp_makespan
+                    if not self._check_reset_deadline(inst, hyp_finish_offset):
                         continue
 
                     acc_id = self._get_account_id(inst)

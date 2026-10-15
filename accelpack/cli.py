@@ -60,12 +60,7 @@ def main():
     reconciler = ExecutionReconciler(history_file=args.history) if args.history else None
     estimator = ProfileDurationEstimator(default_fps=100.0)
 
-    # Replay historical job executions into estimator if history provided
-    if reconciler and reconciler.history:
-        replayed = reconciler.replay_into_estimator(estimator)
-        if replayed > 0:
-            print(f"[OK] Replayed {replayed} historical execution records to initialize throughput profiles.")
-
+    # Step A: Load profiles first (if provided) as baseline/prior state
     if args.profiles and Path(args.profiles).exists():
         try:
             prof_data = json.loads(Path(args.profiles).read_text(encoding="utf-8"))
@@ -81,9 +76,18 @@ def main():
                     workers_per_device=p.get("workers_per_device", 1),
                     samples=p.get("samples", 1),
                     confidence=p.get("confidence", 1.0),
+                    applied_job_ids=p.get("applied_job_ids", []),
                 )
         except Exception as e:
             sys.stderr.write(f"[WARN AccelPack] Could not load profiles database {args.profiles}: {e}\n")
+
+    # Step B: Replay unapplied historical execution records into estimator (if history provided)
+    if reconciler and reconciler.history:
+        replayed = reconciler.replay_into_estimator(estimator)
+        if replayed > 0:
+            print(f"[OK] Replayed {replayed} unapplied historical execution records to calibrate throughput profiles.")
+            if args.profiles:
+                Path(args.profiles).write_text(json.dumps(estimator.to_dict_list(), indent=2), encoding="utf-8")
 
     # Record completed job if requested
     if args.record_job and Path(args.record_job).exists() and reconciler:

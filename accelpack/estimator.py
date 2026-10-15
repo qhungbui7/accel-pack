@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Tuple
 from accelpack.models import Job
 
 
@@ -17,6 +17,7 @@ class ProfileRecord:
     cpu_cores: float = 1.0
     hardware_class: str = "nvidia_t4"
     workers_per_device: int = 1
+    applied_job_ids: List[str] = field(default_factory=list)
 
 
 class ProfileDurationEstimator:
@@ -55,6 +56,7 @@ class ProfileDurationEstimator:
         workers_per_device: int = 1,
         samples: int = 1,
         confidence: float = 1.0,
+        applied_job_ids: Optional[List[str]] = None,
     ) -> None:
         """Registers empirical execution profile isolated by hardware class and concurrency level."""
         if fps <= 0:
@@ -69,6 +71,7 @@ class ProfileDurationEstimator:
             cpu_cores=cpu_cores,
             hardware_class=hardware_class.strip().lower(),
             workers_per_device=max(1, workers_per_device),
+            applied_job_ids=list(applied_job_ids or []),
         )
 
     def get_profile(
@@ -193,6 +196,7 @@ class ProfileDurationEstimator:
                 "workers_per_device": workers,
                 "samples": rec.samples,
                 "confidence": rec.confidence,
+                "applied_job_ids": list(rec.applied_job_ids),
             })
         return result
 

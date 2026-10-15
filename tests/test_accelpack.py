@@ -585,3 +585,190 @@ def test_closed_loop_telemetry_persists_profiles_and_modifies_schedule(tmp_path,
     assert plan_data["total_work_h"] == pytest.approx(1.60, rel=1e-2)
 
 
+def test_cross_instance_critical_path_makespan():
+    """Verify that cross-instance dependent segments calculate true critical path makespan (e.g. 6.1h + 6.1h = 12.2h)."""
+    # Two nodes with 7.0h max session limit each (cannot co-locate two 6.0h jobs on the same node).
+    instances = [
+        Instance(instance_id="node-1", device_count=1, max_session_h=7.0, remaining_quota_h=20.0),
+        Instance(instance_id="node-2", device_count=1, max_session_h=7.0, remaining_quota_h=20.0),
+    ]
+
+    jobs = [
+        Job(job_id="seg0", duration_h=6.0),
+        Job(job_id="seg1", duration_h=6.0, depends_on="seg0"),
+    ]
+
+    scheduler = AccelPackScheduler(setup_overhead_h=0.10)
+    plan = scheduler.schedule(jobs, instances)
+
+    assert len(plan.active_instances) == 2
+    # Individual instance makespans are 6.10h each
+    assert plan.active_instances[0].makespan_h == pytest.approx(6.10)
+    assert plan.active_instances[1].makespan_h == pytest.approx(6.10)
+
+    # Dependency-aware instance timings
+    start_times, finish_times = plan.instance_schedule_timings()
+    assert start_times["node-1"] == pytest.approx(0.0)
+    assert finish_times["node-1"] == pytest.approx(6.10)
+    assert start_times["node-2"] == pytest.approx(6.10)
+    assert finish_times["node-2"] == pytest.approx(12.20)
+
+    # True global makespan must be the sequential critical path: 12.20h (NOT 6.10h!)
+    assert plan.global_makespan_h == pytest.approx(12.20)
+
+    # Summary string must display start and finish offsets
+    summary_text = plan.summary()
+    assert "Start: +6.10h, Finish: 12.20h" in summary_text
+
+
+def test_cross_instance_reset_deadline_enforcement():
+    """Verify that downstream dependent sessions validate reset deadlines accounting for predecessor finish time."""
+    now = datetime.now(timezone.utc)
+    # node-1 reset is in 24 hours (plenty of time for 6.1h job)
+    node1_reset = (now + timedelta(hours=24.0)).isoformat()
+    # node-2 reset is in 10.0 hours. A 5.0h job (+0.10h setup = 5.1h) would fit if run at t=0,
+    # but since it depends on seg0 on node-1 (finishing at t=6.1h), it finishes at 6.1h + 5.1h = 11.2h > 10.0h!
+    node2_reset = (now + timedelta(hours=10.0)).isoformat()
+
+    instances = [
+        Instance(instance_id="node-1", device_count=1, max_session_h=7.0, remaining_quota_h=20.0, reset_at=node1_reset),
+        Instance(instance_id="node-2", device_count=1, max_session_h=7.0, remaining_quota_h=20.0, reset_at=node2_reset),
+    ]
+
+    jobs = [
+        Job(job_id="seg0", duration_h=6.0),
+        Job(job_id="seg1", duration_h=5.0, depends_on="seg0"),
+    ]
+
+    scheduler = AccelPackScheduler(setup_overhead_h=0.10, enforce_reset_deadline=True)
+    # node-2 must be rejected for seg1 because completion time 11.2h exceeds node-2's 10.0h reset deadline
+    with pytest.raises(QuotaExceededException):
+        scheduler.schedule(jobs, instances, allow_partial=False)
+
+
+def test_dependency_graph_validation_errors():
+    """Verify explicit validation errors for self-dependencies, unknown prerequisites, and cycles."""
+    inst = [Instance(instance_id="node-1", device_count=1, remaining_quota_h=20.0)]
+    scheduler = AccelPackScheduler()
+
+    # 1. Self dependency
+    job_self = [Job(job_id="task_a", duration_h=1.0, depends_on="task_a")]
+    with pytest.raises(ValueError, match="self-dependency detected"):
+        scheduler.schedule(job_self, inst)
+
+    # 2. Unknown prerequisite
+    job_unknown = [Job(job_id="task_b", duration_h=1.0, depends_on="missing_prereq")]
+    with pytest.raises(ValueError, match="unknown prerequisite 'missing_prereq'"):
+        scheduler.schedule(job_unknown, inst)
+
+    # 3. Circular dependency cycle (task_1 -> task_2 -> task_1)
+    job_cycle = [
+        Job(job_id="task_1", duration_h=1.0, depends_on="task_2"),
+        Job(job_id="task_2", duration_h=1.0, depends_on="task_1"),
+    ]
+    with pytest.raises(ValueError, match="Circular dependency cycle detected"):
+        scheduler.schedule(job_cycle, inst)
+
+
+def test_cli_history_replay_idempotence_and_precedence(tmp_path, monkeypatch):
+    """Verify that loading profiles first and replaying history is idempotent and does not double-count."""
+    from accelpack import cli
+
+    profiles_file = tmp_path / "profiles.json"
+    history_file = tmp_path / "history.json"
+    inst_file = tmp_path / "inst.json"
+    jobs_file = tmp_path / "jobs.json"
+    out_file = tmp_path / "out.json"
+
+    # Pre-existing profile snapshot with job_1 already applied (FPS = 100.0)
+    initial_profiles = [
+        {
+            "env_id": "cartpole",
+            "model": "mlp",
+            "fps": 100.0,
+            "hardware_class": "nvidia_t4",
+            "workers_per_device": 1,
+            "samples": 1,
+            "confidence": 1.0,
+            "applied_job_ids": ["job_1"],
+        }
+    ]
+    profiles_file.write_text(json.dumps(initial_profiles), encoding="utf-8")
+
+    # History file contains:
+    # 1) job_1 (which was already incorporated in initial_profiles)
+    # 2) job_2 (new unapplied execution with FPS = 200.0)
+    history_records = [
+        {
+            "job_id": "job_1",
+            "env_id": "cartpole",
+            "model": "mlp",
+            "steps": 360000,
+            "predicted_duration_h": 1.0,
+            "actual_duration_h": 1.0,
+            "success": True,
+            "instance_id": "node_prev",
+            "hardware_class": "nvidia_t4",
+            "concurrent_workers_on_device": 1,
+            "measured_fps": 100.0,
+        },
+        {
+            "job_id": "job_2",
+            "env_id": "cartpole",
+            "model": "mlp",
+            "steps": 360000,
+            "predicted_duration_h": 1.0,
+            "actual_duration_h": 0.5,
+            "success": True,
+            "instance_id": "node_prev",
+            "hardware_class": "nvidia_t4",
+            "concurrent_workers_on_device": 1,
+            "measured_fps": 200.0,
+        },
+    ]
+    history_file.write_text(json.dumps(history_records), encoding="utf-8")
+
+    inst_file.write_text(json.dumps([{"instance_id": "n1", "device_count": 1, "remaining_quota_h": 10.0}]))
+    jobs_file.write_text(json.dumps([{"job_id": "eval_job", "duration_h": 1.0}]))
+
+    # Run CLI: should skip job_1 and only replay job_2!
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "accelpack.cli",
+            "--instances", str(inst_file),
+            "--jobs", str(jobs_file),
+            "--profiles", str(profiles_file),
+            "--history", str(history_file),
+            "--output", str(out_file),
+        ],
+    )
+    cli.main()
+
+    saved_profiles = json.loads(profiles_file.read_text(encoding="utf-8"))
+    prof = saved_profiles[0]
+    # Check that job_1 was NOT reapplied, only job_2 was applied
+    # (1 - 0.25)*100.0 + 0.25*200.0 = 125.0 FPS
+    assert prof["fps"] == pytest.approx(125.0)
+    assert set(prof["applied_job_ids"]) == {"job_1", "job_2"}
+
+    # Run CLI a second time: both job_1 and job_2 are already applied!
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "accelpack.cli",
+            "--instances", str(inst_file),
+            "--jobs", str(jobs_file),
+            "--profiles", str(profiles_file),
+            "--history", str(history_file),
+            "--output", str(out_file),
+        ],
+    )
+    cli.main()
+
+    # Profiles must remain identical (idempotent, no double counting)
+    saved_profiles_2 = json.loads(profiles_file.read_text(encoding="utf-8"))
+    assert saved_profiles_2[0]["fps"] == pytest.approx(125.0)
+
+
+

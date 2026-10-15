@@ -123,7 +123,13 @@ Preserved Instances (Untouched): node-02 (24.0h), node-03 (24.0h)
 - **Sequential RAM Reuse:** Sequential jobs assigned to the same worker slot track peak RAM usage without spurious aggregate sum rejections.
 - **Fail-Safe Reset Enforcement:** Blocks execution safely if reset deadlines have passed or timestamp metadata is missing/malformed.
 - **Shared Account Normalization:** Eliminates conflicting quota declarations for instances sharing an `account_id` by adopting the authoritative minimum.
-- **Resumable Checkpoint Segments:** Automatically expands jobs that exceed session limits into ordered discrete segments (`expand_segments=True`).
+- **Resumable Checkpoint Segments:** Automatically expands workloads exceeding session timeouts into dependency-ordered discrete segment assignments (`expand_segments=True`). AccelPack generates sequential execution plans across worker slots and multi-session instances with dependency-aware critical-path timing; the execution controller (e.g., runner or container orchestrator) is responsible for artifact staging, checkpoint saving/resumption, and honoring inter-session dependency metadata.
+
+### Execution Orchestration Boundary
+
+AccelPack is an algorithmic planning and scheduling engine, not a workflow orchestrator:
+- **What AccelPack does:** Generates dependency-ordered, resource-checked assignments, calculates critical-path makespan across multi-session stages, binds sequential segments to worker slots, and evaluates quota safety.
+- **What the caller / execution controller does:** Dispatches container instances, monitors process liveness, serializes and stages checkpoint artifacts between sessions, verifies checkpoint availability before launching downstream dependent segments, and feeds back actual runtimes to the telemetry reconciler.
 - **Hardware-Class Compatibility:** Enforces target hardware family matching before checking physical resource envelopes.
 - **Configurable Concurrency & Slowdown:** Multi-slot device packing with realistic concurrency slowdown degradation models.
 - **Soft CPU Contention Penalty:** Quadratic penalty for CPU oversubscription with configurable emergency hard ceilings.

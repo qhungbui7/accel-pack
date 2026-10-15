@@ -144,6 +144,10 @@ class ExecutionReconciler:
                 hardware_class=hardware_class,
                 workers_per_device=concurrent_workers_on_device,
             )
+            applied = list(existing.applied_job_ids) if existing else []
+            if job_id not in applied:
+                applied.append(job_id)
+
             prior_fps = existing.throughput if existing else (estimator.default_fps / (1.0 + 0.3 * (concurrent_workers_on_device - 1)))
             new_fps = (1.0 - self.learning_rate) * prior_fps + self.learning_rate * actual_fps
             new_samples = (existing.samples + 1) if existing else 1
@@ -163,6 +167,7 @@ class ExecutionReconciler:
                 workers_per_device=concurrent_workers_on_device,
                 samples=new_samples,
                 confidence=new_conf,
+                applied_job_ids=applied,
             )
 
         return rec
@@ -250,7 +255,8 @@ class ExecutionReconciler:
         }
 
     def replay_into_estimator(self, estimator: ProfileDurationEstimator) -> int:
-        """Replays all successful historical job executions to calibrate estimator profiles."""
+        """Replays all successful historical job executions to calibrate estimator profiles,
+        skipping records that have already been incorporated into existing profiles."""
         count = 0
         for rec in self.history:
             if rec.success and rec.measured_fps and rec.measured_fps > 0:
@@ -260,6 +266,13 @@ class ExecutionReconciler:
                     hardware_class=rec.hardware_class,
                     workers_per_device=rec.concurrent_workers_on_device,
                 )
+                if existing and rec.job_id in existing.applied_job_ids:
+                    # Skip duplicate application
+                    continue
+
+                applied = list(existing.applied_job_ids) if existing else []
+                applied.append(rec.job_id)
+
                 prior_fps = existing.throughput if existing else (estimator.default_fps / (1.0 + 0.3 * (rec.concurrent_workers_on_device - 1)))
                 new_fps = (1.0 - self.learning_rate) * prior_fps + self.learning_rate * rec.measured_fps
                 new_samples = (existing.samples + 1) if existing else 1
@@ -279,6 +292,7 @@ class ExecutionReconciler:
                     workers_per_device=rec.concurrent_workers_on_device,
                     samples=new_samples,
                     confidence=new_conf,
+                    applied_job_ids=applied,
                 )
                 count += 1
         return count

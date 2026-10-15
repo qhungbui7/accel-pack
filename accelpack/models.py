@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 
 class PackingStrategy(str, Enum):
@@ -309,10 +309,65 @@ class ExecutionPlan:
         """Total billed quota-hours debited across all active instances."""
         return sum(ip.billed_resource_h for ip in self.instance_plans)
 
+    def instance_schedule_timings(self) -> Tuple[Dict[str, float], Dict[str, float]]:
+        """Calculates dependency-aware start and finish wall-clock offsets for all active instances.
+        
+        If instance B contains a job that depends on a job on instance A, instance B cannot
+        commence execution until instance A finishes its session and persists checkpoints.
+        
+        Returns:
+            (start_times_map, finish_times_map) in hours relative to t=0.
+        """
+        if not self.active_instances:
+            return {}, {}
+
+        # Map each job to its host instance_id
+        job_to_inst: Dict[str, str] = {}
+        for ip in self.active_instances:
+            for s in ip.slots:
+                for j in s.jobs:
+                    job_to_inst[j.job_id] = ip.instance.instance_id
+
+        # Directed graph of instance dependencies: inst_b -> set of inst_a that must finish first
+        inst_prereqs: Dict[str, Set[str]] = {ip.instance.instance_id: set() for ip in self.active_instances}
+        for ip in self.active_instances:
+            b_id = ip.instance.instance_id
+            for s in ip.slots:
+                for j in s.jobs:
+                    if j.depends_on and j.depends_on in job_to_inst:
+                        a_id = job_to_inst[j.depends_on]
+                        if a_id != b_id:
+                            inst_prereqs[b_id].add(a_id)
+
+        start_times: Dict[str, float] = {}
+        finish_times: Dict[str, float] = {}
+        makespans = {ip.instance.instance_id: ip.makespan_h for ip in self.active_instances}
+
+        remaining = set(inst_prereqs.keys())
+        while remaining:
+            ready = [i for i in remaining if inst_prereqs[i].issubset(start_times.keys())]
+            if not ready:
+                for i in remaining:
+                    start_times[i] = 0.0
+                    finish_times[i] = makespans[i]
+                break
+
+            for i in ready:
+                t_start = max([finish_times[p] for p in inst_prereqs[i]], default=0.0)
+                start_times[i] = t_start
+                finish_times[i] = t_start + makespans[i]
+                remaining.remove(i)
+
+        return start_times, finish_times
+
     @property
     def global_makespan_h(self) -> float:
+        """Global elapsed wall-clock critical path makespan across all active instances."""
         if not self.active_instances:
             return 0.0
+        _, finish_times = self.instance_schedule_timings()
+        if finish_times:
+            return max(finish_times.values(), default=0.0)
         return max(ip.makespan_h for ip in self.active_instances)
 
     @property
@@ -336,6 +391,7 @@ class ExecutionPlan:
         return accts
 
     def summary(self) -> str:
+        start_times, finish_times = self.instance_schedule_timings()
         lines = [
             "=" * 70,
             "ACCELPACK WORKLOAD SCHEDULE SUMMARY",
@@ -363,12 +419,19 @@ class ExecutionPlan:
 
         for ip in self.active_instances:
             acc = ip.instance
+            inst_id = acc.instance_id
+            t_start = start_times.get(inst_id, 0.0)
+            t_finish = finish_times.get(inst_id, ip.makespan_h)
+            timing_info = f"Makespan: {ip.makespan_h:.2f}h"
+            if t_start > 0:
+                timing_info = f"Makespan: {ip.makespan_h:.2f}h (Start: +{t_start:.2f}h, Finish: {t_finish:.2f}h)"
+
             cpu_status = f"{ip.peak_host_cpu_cores:.1f}/{acc.host_cpu_cores:.1f} cores ({ip.cpu_oversubscription_ratio * 100:.0f}%)"
             if ip.is_cpu_oversubscribed:
                 cpu_status += " [OVERSUBSCRIBED - Soft Penalty Applied]"
 
             lines.append(
-                f"[{acc.instance_id} (Account: {acc.account_id})] Makespan: {ip.makespan_h:.2f}h | "
+                f"[{acc.instance_id} (Account: {acc.account_id})] {timing_info} | "
                 f"Billed: {ip.billed_resource_h:.2f}h | "
                 f"Quota Remaining After: {ip.quota_remaining_after_h:.2f}h | "
                 f"Workers: {ip.peak_concurrent_workers}/{acc.max_concurrent_workers}"
