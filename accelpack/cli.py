@@ -76,7 +76,7 @@ def main():
                     workers_per_device=p.get("workers_per_device", 1),
                     samples=p.get("samples", 1),
                     confidence=p.get("confidence", 1.0),
-                    applied_job_ids=p.get("applied_job_ids", []),
+                    applied_run_ids=p.get("applied_run_ids", p.get("applied_job_ids", [])),
                 )
         except Exception as e:
             sys.stderr.write(f"[WARN AccelPack] Could not load profiles database {args.profiles}: {e}\n")
@@ -102,6 +102,7 @@ def main():
                 actual_duration_h=run_data.get("actual_duration_h", 0.0),
                 success=run_data.get("success", True),
                 instance_id=run_data.get("instance_id", ""),
+                run_id=run_data.get("run_id"),
                 device_index=run_data.get("device_index", 0),
                 concurrent_workers_on_device=run_data.get("concurrent_workers", 1),
                 hardware_class=run_data.get("hardware_class", "nvidia_t4"),
@@ -184,6 +185,9 @@ def main():
                 resumable=j.get("resumable", False),
                 segments=j.get("segments"),
                 hardware_class=j.get("hardware_class"),
+                depends_on=j.get("depends_on"),
+                parent_job_id=j.get("parent_job_id"),
+                segment_index=j.get("segment_index"),
                 metadata=j.get("metadata", {}),
             )
         )
@@ -253,6 +257,9 @@ def main():
                                     "job_id": j.job_id,
                                     "duration_h": j.duration_h,
                                     "vram_gb": j.vram_gb,
+                                    "depends_on": j.depends_on,
+                                    "parent_job_id": j.parent_job_id,
+                                    "segment_index": j.segment_index,
                                     "metadata": j.metadata,
                                 }
                                 for j in s.jobs

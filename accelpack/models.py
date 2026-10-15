@@ -347,10 +347,11 @@ class ExecutionPlan:
         while remaining:
             ready = [i for i in remaining if inst_prereqs[i].issubset(start_times.keys())]
             if not ready:
-                for i in remaining:
-                    start_times[i] = 0.0
-                    finish_times[i] = makespans[i]
-                break
+                cycle_instances = sorted(list(remaining))
+                raise ValueError(
+                    f"Instance dependency cycle detected among instances: {cycle_instances}. "
+                    f"Cross-instance job dependencies induce an unresolvable multi-session deadlock."
+                )
 
             for i in ready:
                 t_start = max([finish_times[p] for p in inst_prereqs[i]], default=0.0)

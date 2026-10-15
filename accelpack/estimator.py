@@ -17,7 +17,12 @@ class ProfileRecord:
     cpu_cores: float = 1.0
     hardware_class: str = "nvidia_t4"
     workers_per_device: int = 1
-    applied_job_ids: List[str] = field(default_factory=list)
+    applied_run_ids: List[str] = field(default_factory=list)
+
+    @property
+    def applied_job_ids(self) -> List[str]:
+        """Backward-compatible alias for applied_run_ids."""
+        return self.applied_run_ids
 
 
 class ProfileDurationEstimator:
@@ -56,12 +61,14 @@ class ProfileDurationEstimator:
         workers_per_device: int = 1,
         samples: int = 1,
         confidence: float = 1.0,
+        applied_run_ids: Optional[List[str]] = None,
         applied_job_ids: Optional[List[str]] = None,
     ) -> None:
         """Registers empirical execution profile isolated by hardware class and concurrency level."""
         if fps <= 0:
             raise ValueError(f"FPS must be positive, got {fps}")
         key = self._normalize_key(env_id, model, hardware_class, workers_per_device)
+        applied = list(applied_run_ids or applied_job_ids or [])
         self._profiles[key] = ProfileRecord(
             throughput=float(fps),
             samples=samples,
@@ -71,7 +78,7 @@ class ProfileDurationEstimator:
             cpu_cores=cpu_cores,
             hardware_class=hardware_class.strip().lower(),
             workers_per_device=max(1, workers_per_device),
-            applied_job_ids=list(applied_job_ids or []),
+            applied_run_ids=applied,
         )
 
     def get_profile(
@@ -196,7 +203,8 @@ class ProfileDurationEstimator:
                 "workers_per_device": workers,
                 "samples": rec.samples,
                 "confidence": rec.confidence,
-                "applied_job_ids": list(rec.applied_job_ids),
+                "applied_run_ids": list(rec.applied_run_ids),
+                "applied_job_ids": list(rec.applied_run_ids),
             })
         return result
 

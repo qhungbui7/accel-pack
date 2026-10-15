@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import math
 import sys
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -28,6 +29,7 @@ class JobExecutionRecord:
     actual_duration_h: float
     success: bool
     instance_id: str
+    run_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
     device_index: int = 0
     concurrent_workers_on_device: int = 1
     hardware_class: str = "nvidia_t4"
@@ -69,6 +71,8 @@ class ExecutionReconciler:
             try:
                 data = json.loads(self.history_file.read_text(encoding="utf-8"))
                 for r in data:
+                    if "run_id" not in r:
+                        r["run_id"] = r.get("run_id") or r.get("job_id") or uuid.uuid4().hex[:12]
                     self.history.append(JobExecutionRecord(**r))
             except Exception as e:
                 self.load_error = f"Corrupted or invalid history file {self.history_file}: {e}"
@@ -96,6 +100,7 @@ class ExecutionReconciler:
         actual_duration_h: float,
         success: bool,
         instance_id: str,
+        run_id: Optional[str] = None,
         device_index: int = 0,
         concurrent_workers_on_device: int = 1,
         hardware_class: str = "nvidia_t4",
@@ -104,7 +109,14 @@ class ExecutionReconciler:
         cpu_busy_pct: Optional[float] = None,
         estimator: Optional[ProfileDurationEstimator] = None,
     ) -> JobExecutionRecord:
-        """Records a completed job execution and updates the duration estimator profile."""
+        """Records a completed job execution and updates the duration estimator profile idempotently."""
+        effective_run_id = run_id or uuid.uuid4().hex[:12]
+
+        # Check if already recorded in self.history (idempotent submission)
+        for existing_h in self.history:
+            if existing_h.run_id == effective_run_id:
+                return existing_h
+
         actual_fps = (steps / (actual_duration_h * 3600.0)) if actual_duration_h > 0 else 0.0
 
         missing = []
@@ -124,6 +136,7 @@ class ExecutionReconciler:
             actual_duration_h=actual_duration_h,
             success=success,
             instance_id=instance_id,
+            run_id=effective_run_id,
             device_index=device_index,
             concurrent_workers_on_device=concurrent_workers_on_device,
             hardware_class=hardware_class,
@@ -144,9 +157,11 @@ class ExecutionReconciler:
                 hardware_class=hardware_class,
                 workers_per_device=concurrent_workers_on_device,
             )
-            applied = list(existing.applied_job_ids) if existing else []
-            if job_id not in applied:
-                applied.append(job_id)
+            applied = list(existing.applied_run_ids) if existing else []
+            if effective_run_id in applied:
+                return rec
+
+            applied.append(effective_run_id)
 
             prior_fps = existing.throughput if existing else (estimator.default_fps / (1.0 + 0.3 * (concurrent_workers_on_device - 1)))
             new_fps = (1.0 - self.learning_rate) * prior_fps + self.learning_rate * actual_fps
@@ -167,7 +182,7 @@ class ExecutionReconciler:
                 workers_per_device=concurrent_workers_on_device,
                 samples=new_samples,
                 confidence=new_conf,
-                applied_job_ids=applied,
+                applied_run_ids=applied,
             )
 
         return rec
@@ -266,12 +281,12 @@ class ExecutionReconciler:
                     hardware_class=rec.hardware_class,
                     workers_per_device=rec.concurrent_workers_on_device,
                 )
-                if existing and rec.job_id in existing.applied_job_ids:
+                if existing and rec.run_id in existing.applied_run_ids:
                     # Skip duplicate application
                     continue
 
-                applied = list(existing.applied_job_ids) if existing else []
-                applied.append(rec.job_id)
+                applied = list(existing.applied_run_ids) if existing else []
+                applied.append(rec.run_id)
 
                 prior_fps = existing.throughput if existing else (estimator.default_fps / (1.0 + 0.3 * (rec.concurrent_workers_on_device - 1)))
                 new_fps = (1.0 - self.learning_rate) * prior_fps + self.learning_rate * rec.measured_fps
@@ -292,7 +307,7 @@ class ExecutionReconciler:
                     workers_per_device=rec.concurrent_workers_on_device,
                     samples=new_samples,
                     confidence=new_conf,
-                    applied_job_ids=applied,
+                    applied_run_ids=applied,
                 )
                 count += 1
         return count

@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import collections
 import copy
 import math
 from datetime import datetime, timezone
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 from accelpack.models import (
     DeviceSlot,
@@ -110,7 +111,7 @@ class AccelPackScheduler:
         for j in jobs:
             if j.segments and len(j.segments) > 0:
                 for idx, seg_dur in enumerate(j.segments):
-                    prev_id = f"{j.job_id}_seg{idx - 1}" if idx > 0 else None
+                    prev_id = f"{j.job_id}_seg{idx - 1}" if idx > 0 else j.depends_on
                     seg_job = Job(
                         job_id=f"{j.job_id}_seg{idx}",
                         duration_h=seg_dur,
@@ -221,27 +222,102 @@ class AccelPackScheduler:
         if prereq_ip.instance.instance_id == candidate_ip.instance.instance_id:
             return prereq_slot is candidate_slot
 
+        # Reject placement if cross-instance dependency would induce an instance-level cycle/deadlock
+        if self._would_create_instance_cycle(candidate_ip.instance.instance_id, prereq_ip.instance.instance_id, all_plans):
+            return False
+
         return True
 
-    def _get_prerequisite_finish_offset(
+    def _would_create_instance_cycle(
         self,
-        job: Job,
-        candidate_ip: InstancePlan,
+        candidate_inst_id: str,
+        prereq_inst_id: str,
         all_plans: List[InstancePlan],
-    ) -> float:
-        """Returns the elapsed wall-clock finish offset (in hours) of prerequisite job's instance,
-        or 0.0 if job has no prerequisite or prerequisite is co-located on candidate_ip."""
-        if not job.depends_on:
-            return 0.0
+    ) -> bool:
+        """Returns True if adding dependency (candidate_inst_id depends on prereq_inst_id)
+        would introduce a cycle/deadlock across compute instances."""
+        if candidate_inst_id == prereq_inst_id:
+            return False
 
+        # Map each job to its host instance_id
+        job_to_inst: Dict[str, str] = {}
         for ip in all_plans:
             for s in ip.slots:
-                if any(j.job_id == job.depends_on for j in s.jobs):
-                    if ip.instance.instance_id == candidate_ip.instance.instance_id:
-                        return 0.0
-                    _, finish_times = ExecutionPlan(instance_plans=all_plans).instance_schedule_timings()
-                    return finish_times.get(ip.instance.instance_id, ip.makespan_h)
-        return 0.0
+                for j in s.jobs:
+                    job_to_inst[j.job_id] = ip.instance.instance_id
+
+        # Directed graph: inst_id -> set of prerequisite inst_ids that it depends on
+        graph: Dict[str, Set[str]] = {}
+        for ip in all_plans:
+            i_id = ip.instance.instance_id
+            graph.setdefault(i_id, set())
+            for s in ip.slots:
+                for j in s.jobs:
+                    if j.depends_on and j.depends_on in job_to_inst:
+                        p_id = job_to_inst[j.depends_on]
+                        if p_id != i_id:
+                            graph[i_id].add(p_id)
+
+        # A cycle would occur if candidate_inst_id is already reachable from prereq_inst_id
+        visited: Set[str] = set()
+        queue = [prereq_inst_id]
+        while queue:
+            curr = queue.pop(0)
+            if curr == candidate_inst_id:
+                return True
+            if curr not in visited:
+                visited.add(curr)
+                queue.extend(graph.get(curr, set()))
+        return False
+
+    def _get_candidate_instance_start_offset(
+        self,
+        candidate_ip: InstancePlan,
+        candidate_job: Job,
+        all_plans: List[InstancePlan],
+    ) -> float:
+        """Returns the elapsed wall-clock start offset (in hours) of candidate_ip,
+        accounting for all cross-instance prerequisite dependencies of jobs already on candidate_ip
+        as well as candidate_job."""
+        candidate_id = candidate_ip.instance.instance_id
+
+        # Collect all prerequisite job IDs that candidate_ip depends on
+        prereq_job_ids: Set[str] = set()
+        for s in candidate_ip.slots:
+            for j in s.jobs:
+                if j.depends_on:
+                    prereq_job_ids.add(j.depends_on)
+        if candidate_job.depends_on:
+            prereq_job_ids.add(candidate_job.depends_on)
+
+        if not prereq_job_ids:
+            return 0.0
+
+        # Map each job to its host instance_id in all_plans
+        job_to_inst: Dict[str, str] = {}
+        for ip in all_plans:
+            for s in ip.slots:
+                for j in s.jobs:
+                    job_to_inst[j.job_id] = ip.instance.instance_id
+
+        # Find all external instances that candidate_ip must wait for
+        external_prereq_inst_ids: Set[str] = set()
+        for p_jid in prereq_job_ids:
+            if p_jid in job_to_inst:
+                p_inst = job_to_inst[p_jid]
+                if p_inst != candidate_id:
+                    external_prereq_inst_ids.add(p_inst)
+
+        if not external_prereq_inst_ids:
+            return 0.0
+
+        # Calculate finish times of those external prerequisite instances
+        try:
+            _, finish_times = ExecutionPlan(instance_plans=all_plans).instance_schedule_timings()
+        except ValueError:
+            finish_times = {ip.instance.instance_id: ip.makespan_h for ip in all_plans}
+
+        return max((finish_times.get(p_id, 0.0) for p_id in external_prereq_inst_ids), default=0.0)
 
     def schedule(
         self,
@@ -266,10 +342,32 @@ class AccelPackScheduler:
         # 1. Authoritative account quota normalization
         normalized_instances = self._normalize_account_quotas(instances)
 
-        # 2. Expand segmented jobs if enabled
+        # 2. Validate job ID uniqueness
+        job_id_counts = collections.Counter(j.job_id for j in jobs)
+        duplicates = [jid for jid, count in job_id_counts.items() if count > 1]
+        if duplicates:
+            raise ValueError(
+                f"Duplicate job ID detected in workload: {duplicates}. "
+                f"Every job in the workload must have a unique identifier."
+            )
+
+        # Check for collision between generated segment IDs and user-supplied job IDs
+        if self.expand_segments:
+            user_ids = set(job_id_counts.keys())
+            for j in jobs:
+                if j.segments and len(j.segments) > 0:
+                    for idx in range(len(j.segments)):
+                        seg_id = f"{j.job_id}_seg{idx}"
+                        if seg_id in user_ids:
+                            raise ValueError(
+                                f"Generated segment ID '{seg_id}' collides with an existing job ID in the workload. "
+                                f"Rename the conflicting job or adjust the segmented job identifier."
+                            )
+
+        # 3. Expand segmented jobs if enabled
         schedulable_jobs = self._expand_segmented_jobs(jobs)
 
-        # 3. Validate dependency graph (reject unknown prerequisite IDs, self-dependencies, and cycles)
+        # 4. Validate dependency graph (reject unknown prerequisite IDs, self-dependencies, and cycles)
         self._validate_dependency_graph(schedulable_jobs)
 
         # 4. Sort jobs topologically respecting dependencies and objective mode
@@ -456,8 +554,8 @@ class AccelPackScheduler:
                         continue
 
                     # Check reset deadline safely against completion time relative to t=0
-                    prereq_offset = self._get_prerequisite_finish_offset(job, ip, instance_plans)
-                    hyp_finish_offset = prereq_offset + hyp_makespan
+                    inst_start_offset = self._get_candidate_instance_start_offset(ip, job, instance_plans)
+                    hyp_finish_offset = inst_start_offset + hyp_makespan
                     if not self._check_reset_deadline(inst, hyp_finish_offset):
                         continue
 
@@ -568,8 +666,8 @@ class AccelPackScheduler:
                         continue
 
                     # Check reset deadline safely against completion time relative to t=0
-                    prereq_offset = self._get_prerequisite_finish_offset(job, ip, active_plans)
-                    hyp_finish_offset = prereq_offset + hyp_makespan
+                    inst_start_offset = self._get_candidate_instance_start_offset(ip, job, active_plans)
+                    hyp_finish_offset = inst_start_offset + hyp_makespan
                     if not self._check_reset_deadline(inst, hyp_finish_offset):
                         continue
 

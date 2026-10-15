@@ -771,4 +771,213 @@ def test_cli_history_replay_idempotence_and_precedence(tmp_path, monkeypatch):
     assert saved_profiles_2[0]["fps"] == pytest.approx(125.0)
 
 
+def test_instance_level_dependency_cycle_raises_explicit_error():
+    """Verify that cross-instance dependency cycles raise ValueError instead of fabricating a 0.0 makespan."""
+    # Two instances
+    inst1 = Instance(instance_id="node-A", device_count=1)
+    inst2 = Instance(instance_id="node-B", device_count=1)
+
+    # Acyclic job DAG:
+    # ja1 (none) -> jb1 (depends on ja1)
+    # jb2 (none) -> ja2 (depends on jb2)
+    # Job-level graph is completely acyclic!
+    ja1 = Job(job_id="ja1", duration_h=1.0)
+    jb1 = Job(job_id="jb1", duration_h=1.0, depends_on="ja1")
+    jb2 = Job(job_id="jb2", duration_h=1.0)
+    ja2 = Job(job_id="ja2", duration_h=1.0, depends_on="ja2_prereq_jb2", parent_job_id="jb2")
+    # Explicitly set dependency to induce cycle across nodes
+    ja2.depends_on = "jb2"
+
+    slot_a = DeviceSlot(instance_id="node-A", device_index=0, slot_index=0, jobs=[ja1, ja2])
+    slot_b = DeviceSlot(instance_id="node-B", device_index=0, slot_index=0, jobs=[jb1, jb2])
+
+    plan = ExecutionPlan(
+        instance_plans=[
+            InstancePlan(instance=inst1, slots=[slot_a]),
+            InstancePlan(instance=inst2, slots=[slot_b]),
+        ]
+    )
+
+    # Because node-A depends on node-B (for ja2) and node-B depends on node-A (for jb1),
+    # instance_schedule_timings MUST detect the deadlock cycle and raise ValueError!
+    with pytest.raises(ValueError, match="Instance dependency cycle detected"):
+        plan.instance_schedule_timings()
+
+
+def test_downstream_instance_unrelated_job_evaluates_start_offset():
+    """Verify that an instance already delayed by a predecessor dependency evaluates reset deadlines
+    for subsequent unrelated jobs using the instance's full start offset."""
+    now = datetime.now(timezone.utc)
+    # node-1 reset in 24h
+    node1_reset = (now + timedelta(hours=24.0)).isoformat()
+    # node-2 reset in 10.0h
+    node2_reset = (now + timedelta(hours=10.0)).isoformat()
+
+    instances = [
+        Instance(instance_id="node-1", device_count=1, max_session_h=7.0, remaining_quota_h=20.0, reset_at=node1_reset),
+        Instance(instance_id="node-2", device_count=1, max_session_h=7.0, remaining_quota_h=20.0, reset_at=node2_reset),
+    ]
+
+    # Workload:
+    # 1. seg0 on node-1: 6.0h + 0.1h = 6.1h finish
+    # 2. seg1 on node-2: depends on seg0, 3.0h duration (+ 0.1h setup = 3.1h makespan)
+    #    On node-2, start offset is 6.1h. Finish time is 6.1 + 3.1 = 9.2h <= 10.0h (FITS!)
+    # 3. job_unrelated: 2.0h duration, depends_on=None.
+    #    Cannot fit on node-1 (6.0h + 2.0h = 8.0h > 7.0h session limit).
+    #    If considered for node-2: hypothetical makespan on node-2 = 3.0h + 2.0h + 0.1h = 5.1h.
+    #    If checked from t=0, 5.1h <= 10.0h would falsely pass.
+    #    BUT with node-2 start offset = 6.1h: finish offset is 6.1h + 5.1h = 11.2h > 10.0h!
+    #    Must be rejected due to reset deadline!
+    jobs = [
+        Job(job_id="seg0", duration_h=6.0),
+        Job(job_id="seg1", duration_h=3.0, depends_on="seg0"),
+        Job(job_id="job_unrelated", duration_h=2.0),
+    ]
+
+    scheduler = AccelPackScheduler(setup_overhead_h=0.10, enforce_reset_deadline=True)
+    with pytest.raises(QuotaExceededException):
+        scheduler.schedule(jobs, instances, allow_partial=False)
+
+
+def test_cli_and_expansion_preserves_external_depends_on(tmp_path, monkeypatch):
+    """Verify that CLI JSON loading and segment expansion preserve explicit job dependencies."""
+    from accelpack import cli
+
+    # 1. Verify segment expansion inherits parent's external depends_on
+    sched = AccelPackScheduler(expand_segments=True)
+    prep_job = Job(job_id="prep_step", duration_h=1.0)
+    segmented_job = Job(job_id="sim_task", duration_h=6.0, resumable=True, segments=[3.0, 3.0], depends_on="prep_step")
+
+    expanded = sched._expand_segmented_jobs([prep_job, segmented_job])
+    seg0 = next(j for j in expanded if j.job_id == "sim_task_seg0")
+    seg1 = next(j for j in expanded if j.job_id == "sim_task_seg1")
+
+    assert seg0.depends_on == "prep_step"
+    assert seg1.depends_on == "sim_task_seg0"
+
+    # 2. Verify CLI preserves depends_on from JSON input
+    jobs_file = tmp_path / "dep_jobs.json"
+    inst_file = tmp_path / "dep_inst.json"
+    out_file = tmp_path / "dep_out.json"
+
+    jobs_file.write_text(
+        json.dumps([
+            {"job_id": "step_a", "duration_h": 2.0},
+            {"job_id": "step_b", "duration_h": 2.0, "depends_on": "step_a"},
+        ]),
+        encoding="utf-8",
+    )
+    inst_file.write_text(
+        json.dumps([{"instance_id": "node_x", "device_count": 2, "remaining_quota_h": 20.0}]),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "accelpack.cli",
+            "--instances", str(inst_file),
+            "--jobs", str(jobs_file),
+            "--output", str(out_file),
+        ],
+    )
+    cli.main()
+
+    plan_data = json.loads(out_file.read_text(encoding="utf-8"))
+    scheduled_b = next(
+        j for inst in plan_data["instances"]
+        for slot in inst["slots"]
+        for j in slot["jobs"]
+        if j["job_id"] == "step_b"
+    )
+    assert scheduled_b["depends_on"] == "step_a"
+
+
+def test_telemetry_run_id_idempotence_and_distinct_executions(tmp_path):
+    """Verify that record_job is idempotent for duplicate run_ids and accurately records distinct runs of the same job."""
+    history_file = tmp_path / "hist.json"
+    reconciler = ExecutionReconciler(history_file=history_file)
+    estimator = ProfileDurationEstimator(default_fps=100.0)
+
+    # Run A: First execution of logical job "train_cifar"
+    rec1 = reconciler.record_job(
+        job_id="train_cifar",
+        env_id="cifar",
+        model="resnet",
+        steps=360000,
+        predicted_duration_h=1.0,
+        actual_duration_h=1.0,  # 100 FPS
+        success=True,
+        instance_id="node1",
+        run_id="run_001",
+        estimator=estimator,
+    )
+    assert len(reconciler.history) == 1
+    prof1 = estimator.get_profile(env_id="cifar", model="resnet")
+    assert prof1.throughput == pytest.approx(100.0)
+    assert prof1.samples == 1
+    assert "run_001" in prof1.applied_run_ids
+
+    # Run A duplicate submission (same run_id): must be idempotent!
+    rec1_dup = reconciler.record_job(
+        job_id="train_cifar",
+        env_id="cifar",
+        model="resnet",
+        steps=360000,
+        predicted_duration_h=1.0,
+        actual_duration_h=1.0,
+        success=True,
+        instance_id="node1",
+        run_id="run_001",
+        estimator=estimator,
+    )
+    assert rec1_dup is rec1
+    assert len(reconciler.history) == 1
+    assert prof1.samples == 1  # Samples did NOT increment!
+    assert prof1.throughput == pytest.approx(100.0)  # No duplicate moving-average shift!
+
+    # Run B: Second distinct execution of the same logical job "train_cifar" (run_id="run_002", ran faster at 200 FPS)
+    reconciler.record_job(
+        job_id="train_cifar",
+        env_id="cifar",
+        model="resnet",
+        steps=360000,
+        predicted_duration_h=1.0,
+        actual_duration_h=0.5,  # 200 FPS
+        success=True,
+        instance_id="node1",
+        run_id="run_002",
+        estimator=estimator,
+    )
+    assert len(reconciler.history) == 2
+    prof2 = estimator.get_profile(env_id="cifar", model="resnet")
+    assert prof2.samples == 2
+    assert "run_002" in prof2.applied_run_ids
+    # Calibrated: (1 - 0.25)*100.0 + 0.25*200.0 = 125.0 FPS
+    assert prof2.throughput == pytest.approx(125.0)
+
+
+def test_duplicate_job_ids_and_segment_id_collisions_rejected():
+    """Verify that duplicate user job IDs and collisions with generated segment IDs fail explicitly."""
+    inst = [Instance(instance_id="node-1", device_count=1, remaining_quota_h=20.0)]
+    scheduler = AccelPackScheduler(expand_segments=True)
+
+    # 1. Duplicate user job IDs
+    dup_jobs = [
+        Job(job_id="train_job_1", duration_h=1.0),
+        Job(job_id="train_job_1", duration_h=2.0),
+    ]
+    with pytest.raises(ValueError, match="Duplicate job ID detected in workload"):
+        scheduler.schedule(dup_jobs, inst)
+
+    # 2. Collision with generated segment ID
+    colliding_jobs = [
+        Job(job_id="sim_work", duration_h=4.0, segments=[2.0, 2.0]),
+        Job(job_id="sim_work_seg0", duration_h=1.0),
+    ]
+    with pytest.raises(ValueError, match="collides with an existing job ID"):
+        scheduler.schedule(colliding_jobs, inst)
+
+
+
 
