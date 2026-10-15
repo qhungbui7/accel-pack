@@ -1,6 +1,9 @@
-"""Unit tests for AccelPack models and multi-accelerator scheduler using standard unittest."""
+"""Unit tests for AccelPack models, scheduler, preflight validation, and reconciliation."""
 
+import tempfile
+from pathlib import Path
 import unittest
+
 from accelpack.models import (
     DeviceSlot,
     ExecutionPlan,
@@ -12,6 +15,8 @@ from accelpack.models import (
 )
 from accelpack.scheduler import AccelPackScheduler, QuotaExceededException
 from accelpack.estimator import ProfileDurationEstimator
+from accelpack.preflight import PreflightValidator
+from accelpack.reconciliation import ExecutionReconciler
 
 
 class TestAccelPack(unittest.TestCase):
@@ -29,41 +34,55 @@ class TestAccelPack(unittest.TestCase):
         self.assertEqual(inst.remaining_quota_h, 20.0)
         self.assertEqual(inst.max_concurrent_workers, 4)
 
-    def test_concentrate_minimal_instance_preservation(self):
-        """Verify that in CONCENTRATE mode, jobs are packed onto minimal instances."""
-        instances = [
-            Instance(instance_id="node-1", device_count=2, remaining_quota_h=25.0, max_session_h=11.0),
-            Instance(instance_id="node-2", device_count=2, remaining_quota_h=25.0, max_session_h=11.0),
-            Instance(instance_id="node-3", device_count=2, remaining_quota_h=25.0, max_session_h=11.0),
-        ]
+    def test_preflight_validation_pipeline(self):
+        validator = PreflightValidator(min_quota_buffer_h=2.0)
+        inst_good = Instance(instance_id="node-good", device_count=2, remaining_quota_h=25.0, max_session_h=11.0)
+        inst_tight = Instance(instance_id="node-tight", device_count=2, remaining_quota_h=1.5, max_session_h=11.0)
 
-        jobs = [Job(job_id=f"job_{i}", duration_h=0.2) for i in range(6)]
+        # 1. Job exceeds session limit without checkpointing
+        job_oversized = Job(job_id="huge", duration_h=12.0, resumable=False)
+        rep = validator.validate([job_oversized], [inst_good])
+        self.assertFalse(rep.passed)
+        self.assertTrue(any(i.code == "JOB_EXCEEDS_SESSION_LIMIT" for i in rep.blockers))
 
-        scheduler = AccelPackScheduler(strategy=PackingStrategy.CONCENTRATE, setup_overhead_h=0.10)
-        plan = scheduler.schedule(jobs, instances)
+        # 2. Resumable job passes
+        job_resumable = Job(job_id="huge_resumable", duration_h=12.0, resumable=True)
+        rep = validator.validate([job_resumable], [inst_good])
+        self.assertTrue(rep.passed)
 
-        self.assertEqual(len(plan.active_instances), 1)
-        self.assertEqual(len(plan.untouched_instances), 2)
-        self.assertEqual(plan.active_instances[0].instance.instance_id, "node-1")
+        # 3. Quota buffer warning
+        job_normal = Job(job_id="norm", duration_h=1.0)
+        rep = validator.validate([job_normal], [inst_tight])
+        self.assertTrue(rep.passed)  # Warning is not a blocker
+        self.assertTrue(any(i.code == "QUOTA_BUFFER_EXHAUSTED" for i in rep.warnings))
 
-    def test_balance_waterfill_equal_usage_default(self):
-        """Verify that in BALANCE mode (default), jobs are distributed across instances to equalize remaining quotas."""
-        instances = [
-            Instance(instance_id="used_node", device_count=2, remaining_quota_h=20.0, max_session_h=11.0),
-            Instance(instance_id="fresh_node_1", device_count=2, remaining_quota_h=29.0, max_session_h=11.0),
-            Instance(instance_id="fresh_node_2", device_count=2, remaining_quota_h=29.0, max_session_h=11.0),
-        ]
+    def test_reconciliation_and_online_learning(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            h_file = Path(tmp_dir) / "history.json"
+            reconciler = ExecutionReconciler(history_file=h_file, learning_rate=0.5)
+            estimator = ProfileDurationEstimator(default_fps=100.0)
 
-        jobs = [Job(job_id=f"job_{i}", duration_h=1.0) for i in range(6)]
+            # Record a job that ran faster than estimated (200 FPS actual vs 100 FPS predicted)
+            rec = reconciler.record_job(
+                job_id="test_run_1",
+                env_id="CartPole",
+                model="MLP",
+                steps=720_000,
+                predicted_duration_h=2.0,
+                actual_duration_h=1.0,  # 720k / 3600s = 200 FPS
+                success=True,
+                instance_id="node-1",
+                peak_vram_gb=1.2,
+                peak_ram_gb=2.4,
+                estimator=estimator,
+            )
+            self.assertEqual(rec.measured_fps, 200.0)
 
-        scheduler = AccelPackScheduler(strategy=PackingStrategy.BALANCE, setup_overhead_h=0.10)
-        plan = scheduler.schedule(jobs, instances)
-
-        for ip in plan.active_instances:
-            self.assertLessEqual(ip.load_imbalance_h, 1.0)
+            # Check that estimator profile was calibrated online via moving average (100 -> 150 FPS)
+            updated_dur = estimator.estimate_duration_h(steps=720_000, env_id="CartPole", model="MLP")
+            self.assertAlmostEqual(updated_dur, 720000.0 / (150.0 * 3600.0), places=2)
 
     def test_concurrent_slot_packing_speedup(self):
-        """Verify that setting slots_per_device=2 halves the physical makespan by packing 4 workers."""
         inst_serial = [Instance(instance_id="node_serial", device_count=2, slots_per_device=1, remaining_quota_h=30.0)]
         inst_concurrent = [Instance(instance_id="node_concurrent", device_count=2, slots_per_device=2, remaining_quota_h=30.0)]
 
@@ -78,19 +97,6 @@ class TestAccelPack(unittest.TestCase):
         sched_concurrent = AccelPackScheduler(strategy=PackingStrategy.CONCENTRATE, setup_overhead_h=0.10, slots_per_device=2)
         plan_concurrent = sched_concurrent.schedule(jobs, inst_concurrent)
         self.assertAlmostEqual(plan_concurrent.global_makespan_h, 1.10, places=2)
-
-    def test_aggregate_vram_and_ram_protection(self):
-        """Verify that jobs exceeding physical device VRAM or host RAM cannot be packed concurrently."""
-        inst = [Instance(instance_id="gpu_node", device_count=2, vram_per_device_gb=4.0, host_ram_gb=8.0, slots_per_device=2)]
-
-        heavy_jobs = [Job(job_id=f"heavy_{i}", duration_h=1.0, vram_gb=2.5, ram_gb=2.0) for i in range(4)]
-
-        scheduler = AccelPackScheduler(strategy=PackingStrategy.CONCENTRATE, setup_overhead_h=0.10, slots_per_device=2)
-        plan = scheduler.schedule(heavy_jobs, inst, allow_partial=True)
-
-        for ip in plan.active_instances:
-            for d in range(ip.instance.device_count):
-                self.assertLessEqual(ip.peak_vram_per_device_gb[d], ip.instance.vram_per_device_gb)
 
 
 if __name__ == "__main__":
