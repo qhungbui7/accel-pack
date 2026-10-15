@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Optional
@@ -31,6 +32,8 @@ class Job:
     device_count: int = 1
     priority: float = 1.0
     resumable: bool = False
+    segments: Optional[List[float]] = None     # Optional checkpoint segments (hours per segment)
+    hardware_class: Optional[str] = None      # Target hardware class requirement (e.g. "nvidia_t4")
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self):
@@ -38,24 +41,62 @@ class Job:
             raise ValueError(f"Job duration must be > 0, got {self.duration_h}")
         if self.device_count != 1:
             raise NotImplementedError("Multi-accelerator single-job gang scheduling is not yet supported.")
+        if self.segments is not None:
+            if not self.segments:
+                raise ValueError("Job segments list cannot be empty if specified.")
+            if any(s <= 0 for s in self.segments):
+                raise ValueError(f"All segments must be > 0 hours, got {self.segments}")
+            seg_sum = sum(self.segments)
+            if not math.isclose(seg_sum, self.duration_h, rel_tol=1e-2, abs_tol=1e-2):
+                raise ValueError(
+                    f"Sum of segment durations ({seg_sum:.3f}h) must match duration_h ({self.duration_h:.3f}h)"
+                )
 
 
 @dataclass
 class Instance:
-    """A compute node host providing multi-accelerator devices with session & quota boundaries."""
+    """A compute node host providing multi-accelerator devices with session & quota boundaries.
+    
+    Attributes:
+        instance_id: Unique instance identifier.
+        account_id: Account or quota pool identifier. Multiple instances can share the same
+                    account_id to share a single quota balance. Defaults to instance_id.
+        device_count: Number of physical accelerator devices.
+        remaining_quota_h: Remaining quota in hours.
+        max_session_h: Maximum duration of a single execution session.
+        vram_per_device_gb: VRAM capacity per physical device.
+        host_ram_gb: Host physical memory capacity.
+        host_cpu_cores: Available host vCPUs / CPU cores.
+        slots_per_device: Maximum concurrent worker execution streams per physical device.
+        debit_rate: Quota debit multiplier per container wall-clock hour.
+        reset_at: Optional ISO 8601 timestamp string for quota refresh.
+        must_finish_before_reset: If True, jobs must complete before reset_at deadline.
+        hardware_class: Hardware accelerator class (e.g. "nvidia_t4", "nvidia_p100").
+        concurrency_slowdown_factors: Mapping from active workers per device to duration slowdown multiplier.
+        max_cpu_oversubscription_ratio: Optional hard cutoff for CPU oversubscription. None allows soft penalty.
+    """
     instance_id: str
+    account_id: Optional[str] = None
     device_count: int = 2
     remaining_quota_h: float = 30.0
     max_session_h: float = 11.0
     vram_per_device_gb: float = 16.0
     host_ram_gb: float = 30.0
     host_cpu_cores: float = 4.0
-    slots_per_device: int = 1       # Number of concurrent worker execution streams per physical device
-    debit_rate: float = 1.0         # Quota debit multiplier per container wall-clock hour
+    slots_per_device: int = 1
+    debit_rate: float = 1.0
     reset_at: Optional[str] = None
+    must_finish_before_reset: bool = False
+    hardware_class: str = "nvidia_t4"
+    concurrency_slowdown_factors: Dict[int, float] = field(
+        default_factory=lambda: {1: 1.0, 2: 1.30, 3: 1.65, 4: 2.0}
+    )
+    max_cpu_oversubscription_ratio: Optional[float] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self):
+        if not self.account_id:
+            self.account_id = self.instance_id
         if self.device_count <= 0:
             raise ValueError(f"device_count must be > 0, got {self.device_count}")
         if self.max_session_h <= 0:
@@ -69,6 +110,17 @@ class Instance:
     def max_concurrent_workers(self) -> int:
         return self.device_count * self.slots_per_device
 
+    def get_concurrency_slowdown(self, concurrent_workers: int) -> float:
+        """Returns the duration slowdown factor for concurrent workers on the same physical device."""
+        if concurrent_workers <= 1:
+            return 1.0
+        if concurrent_workers in self.concurrency_slowdown_factors:
+            return self.concurrency_slowdown_factors[concurrent_workers]
+        # Conservative linear interpolation fallback
+        max_known = max(self.concurrency_slowdown_factors.keys(), default=1)
+        base = self.concurrency_slowdown_factors.get(max_known, 1.0 + 0.3 * (max_known - 1))
+        return base + 0.35 * (concurrent_workers - max_known)
+
 
 @dataclass
 class DeviceSlot:
@@ -76,15 +128,19 @@ class DeviceSlot:
     instance_id: str
     device_index: int
     slot_index: int = 0
-    load_h: float = 0.0
+    load_h: float = 0.0  # Base worker-hours assigned to this slot
     jobs: List[Job] = field(default_factory=list)
 
-    def can_fit_session(self, job: Job, max_session_h: float) -> bool:
-        return (self.load_h + job.duration_h) <= max_session_h
+    def can_fit_session(self, job: Job, max_session_h: float, slowdown: float = 1.0) -> bool:
+        return (self.load_h + job.duration_h) * slowdown <= max_session_h
 
     def assign(self, job: Job) -> None:
         self.jobs.append(job)
         self.load_h += job.duration_h
+
+    def effective_load_h(self, slowdown: float = 1.0) -> float:
+        """Returns effective wall-clock duration accounting for concurrency slowdown."""
+        return self.load_h * slowdown
 
     @property
     def peak_vram_gb(self) -> float:
@@ -112,14 +168,33 @@ class InstancePlan:
 
     @property
     def total_work_h(self) -> float:
+        """Total unscaled worker-hours of computational work across all slots."""
         return sum(s.load_h for s in self.slots)
+
+    def active_workers_on_device(self, device_index: int) -> int:
+        """Number of active concurrent worker slots populated on this physical device."""
+        return sum(1 for s in self.slots if s.device_index == device_index and len(s.jobs) > 0)
+
+    @property
+    def device_slowdowns(self) -> Dict[int, float]:
+        """Slowdown factor applied to each physical device based on its concurrent worker count."""
+        slowdowns: Dict[int, float] = {}
+        for d in range(self.instance.device_count):
+            workers = self.active_workers_on_device(d)
+            slowdowns[d] = self.instance.get_concurrency_slowdown(workers)
+        return slowdowns
 
     @property
     def device_loads_h(self) -> Dict[int, float]:
-        """Calculates effective wall-clock load per physical device across its concurrent execution slots."""
+        """Calculates effective wall-clock load per physical device across its concurrent execution slots,
+        accounting for concurrency slowdown when multiple worker slots run on the same physical device.
+        """
         loads: Dict[int, float] = {d: 0.0 for d in range(self.instance.device_count)}
+        slowdowns = self.device_slowdowns
         for s in self.slots:
-            loads[s.device_index] = max(loads.get(s.device_index, 0.0), s.load_h)
+            s_slowdown = slowdowns.get(s.device_index, 1.0)
+            effective_slot_load = s.effective_load_h(s_slowdown)
+            loads[s.device_index] = max(loads.get(s.device_index, 0.0), effective_slot_load)
         return loads
 
     @property
@@ -138,9 +213,9 @@ class InstancePlan:
     def billed_resource_h(self) -> float:
         if not self.is_active:
             return 0.0
-        # Configurable, calibrated quota accounting:
-        # Defaults to 1.0 * makespan for wall-clock account session quotas,
-        # or device_count * makespan if debit_rate is configured for device-hours.
+        # Configurable quota debit semantics:
+        # Defaults to debit_rate * makespan_h (e.g. 1.0 * wall-clock session hours on Kaggle,
+        # or 2.0 * makespan_h if debiting per physical device-hour).
         return self.instance.debit_rate * self.makespan_h
 
     @property
@@ -171,7 +246,25 @@ class InstancePlan:
 
     @property
     def peak_host_cpu_cores(self) -> float:
-        return sum(s.peak_cpu_cores for s in self.slots)
+        """Estimated concurrent CPU demand across all active worker slots on this instance."""
+        return sum(s.peak_cpu_cores for s in self.slots if len(s.jobs) > 0)
+
+    @property
+    def cpu_oversubscription_ratio(self) -> float:
+        """Ratio of peak aggregate CPU demand to available physical host vCPUs."""
+        if self.instance.host_cpu_cores <= 0:
+            return 1.0
+        return self.peak_host_cpu_cores / self.instance.host_cpu_cores
+
+    @property
+    def is_cpu_oversubscribed(self) -> bool:
+        """True if estimated concurrent CPU demand exceeds nominal host vCPU capacity."""
+        return self.peak_host_cpu_cores > self.instance.host_cpu_cores
+
+    @property
+    def cpu_contention_penalty(self) -> float:
+        """Soft penalty cost for CPU oversubscription: max(0, cpu_ratio - 1) ** 2."""
+        return max(0.0, self.cpu_oversubscription_ratio - 1.0) ** 2
 
 
 @dataclass
@@ -190,10 +283,12 @@ class ExecutionPlan:
 
     @property
     def total_work_h(self) -> float:
+        """Total useful worker-hours of computational work planned."""
         return sum(ip.total_work_h for ip in self.instance_plans)
 
     @property
     def total_billed_resource_h(self) -> float:
+        """Total billed quota-hours debited across all active instances."""
         return sum(ip.billed_resource_h for ip in self.instance_plans)
 
     @property
@@ -203,10 +298,24 @@ class ExecutionPlan:
         return max(ip.makespan_h for ip in self.active_instances)
 
     @property
-    def efficiency_ratio(self) -> float:
+    def quota_productivity_ratio(self) -> float:
+        """Useful worker-hours completed per billed quota-hour (unclipped, can exceed 1.0 with concurrency)."""
         if self.total_billed_resource_h <= 0:
-            return 1.0
-        return min(1.0, self.total_work_h / self.total_billed_resource_h)
+            return 0.0
+        return self.total_work_h / self.total_billed_resource_h
+
+    @property
+    def efficiency_ratio(self) -> float:
+        """Unclipped productivity ratio (useful worker-hours / billed quota-hours)."""
+        return self.quota_productivity_ratio
+
+    def account_billed_quota(self) -> Dict[str, float]:
+        """Aggregate billed quota hours grouped by account_id."""
+        accts: Dict[str, float] = {}
+        for ip in self.active_instances:
+            acc_id = ip.instance.account_id or ip.instance.instance_id
+            accts[acc_id] = accts.get(acc_id, 0.0) + ip.billed_resource_h
+        return accts
 
     def summary(self) -> str:
         lines = [
@@ -217,24 +326,48 @@ class ExecutionPlan:
             f"({len(self.untouched_instances)} preserved untouched)",
             f"Total Work: {self.total_work_h:.2f} worker-hours",
             f"Total Billed Resource Time: {self.total_billed_resource_h:.2f} quota-hours",
-            f"Packing Efficiency: {self.efficiency_ratio * 100:.1f}%",
+            f"Quota Productivity: {self.quota_productivity_ratio * 100:.1f}% "
+            f"({self.quota_productivity_ratio:.2f} worker-hours / billed quota-hour)",
             f"Global Makespan: {self.global_makespan_h:.2f} hours",
             "-" * 70,
         ]
 
+        # Account-level quota summary
+        acct_billed = self.account_billed_quota()
+        if len(acct_billed) > 1 or any(ip.instance.account_id != ip.instance.instance_id for ip in self.instance_plans):
+            lines.append("ACCOUNT QUOTA POOLS:")
+            for acc_id, billed in acct_billed.items():
+                matching_insts = [ip.instance for ip in self.instance_plans if ip.instance.account_id == acc_id]
+                pool_quota = matching_insts[0].remaining_quota_h if matching_insts else 0.0
+                rem_after = max(0.0, pool_quota - billed)
+                lines.append(f"  * Account [{acc_id}]: Billed {billed:.2f}h | Remaining After {rem_after:.2f}h / {pool_quota:.2f}h")
+            lines.append("-" * 70)
+
         for ip in self.active_instances:
             acc = ip.instance
+            cpu_status = f"{ip.peak_host_cpu_cores:.1f}/{acc.host_cpu_cores:.1f} cores ({ip.cpu_oversubscription_ratio * 100:.0f}%)"
+            if ip.is_cpu_oversubscribed:
+                cpu_status += " [OVERSUBSCRIBED - Soft Penalty Applied]"
+
             lines.append(
-                f"[{acc.instance_id}] Makespan: {ip.makespan_h:.2f}h | "
+                f"[{acc.instance_id} (Account: {acc.account_id})] Makespan: {ip.makespan_h:.2f}h | "
                 f"Billed: {ip.billed_resource_h:.2f}h | "
                 f"Quota Remaining After: {ip.quota_remaining_after_h:.2f}h | "
                 f"Workers: {ip.peak_concurrent_workers}/{acc.max_concurrent_workers}"
             )
+            lines.append(f"  CPU Demand: {cpu_status}")
+
             for d in range(acc.device_count):
                 d_slots = [s for s in ip.slots if s.device_index == d]
                 d_load = ip.device_loads_h.get(d, 0.0)
                 d_vram = ip.peak_vram_per_device_gb.get(d, 0.0)
-                lines.append(f"  ├── Device {d} (Wall-load: {d_load:.2f}h, Peak VRAM: {d_vram:.2f}/{acc.vram_per_device_gb} GB):")
+                d_slowdown = ip.device_slowdowns.get(d, 1.0)
+                d_workers = ip.active_workers_on_device(d)
+                slowdown_label = f" (Slowdown: {d_slowdown:.2f}x for {d_workers} workers)" if d_workers > 1 else ""
+                lines.append(
+                    f"  ├── Device {d} (Wall-load: {d_load:.2f}h{slowdown_label}, "
+                    f"Peak VRAM: {d_vram:.2f}/{acc.vram_per_device_gb} GB):"
+                )
                 for s in d_slots:
                     slot_label = f"Slot {s.slot_index}" if acc.slots_per_device > 1 else "Queue"
                     if not s.jobs:

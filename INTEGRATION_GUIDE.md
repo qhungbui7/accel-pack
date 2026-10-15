@@ -48,7 +48,8 @@ repo-root/
 ```json
 [
   {
-    "instance_id": "account_primary",
+    "instance_id": "account_primary_t4x2",
+    "account_id": "kaggle_user_1",
     "device_count": 2,
     "remaining_quota_h": 28.5,
     "max_session_h": 11.0,
@@ -57,7 +58,16 @@ repo-root/
     "host_cpu_cores": 4.0,
     "slots_per_device": 2,
     "debit_rate": 1.0,
-    "reset_at": "2026-10-17T00:00:00Z"
+    "reset_at": "2026-10-17T00:00:00Z",
+    "must_finish_before_reset": false,
+    "hardware_class": "nvidia_t4",
+    "concurrency_slowdown_factors": {
+      "1": 1.0,
+      "2": 1.30,
+      "3": 1.65,
+      "4": 2.00
+    },
+    "max_cpu_oversubscription_ratio": null
   }
 ]
 ```
@@ -73,6 +83,8 @@ repo-root/
     "cpu_cores": 1.0,
     "priority": 1.0,
     "resumable": true,
+    "segments": null,
+    "hardware_class": "nvidia_t4",
     "metadata": {
       "env": "cartpole",
       "model": "gru128",

@@ -46,7 +46,7 @@ class TestAccelPack(unittest.TestCase):
         self.assertTrue(any(i.code == "JOB_EXCEEDS_SESSION_LIMIT" for i in rep.blockers))
 
         # 2. Resumable job passes
-        job_resumable = Job(job_id="huge_resumable", duration_h=12.0, resumable=True)
+        job_resumable = Job(job_id="huge_resumable", duration_h=12.0, resumable=True, segments=[6.0, 6.0])
         rep = validator.validate([job_resumable], [inst_good])
         self.assertTrue(rep.passed)
 
@@ -84,7 +84,10 @@ class TestAccelPack(unittest.TestCase):
 
     def test_concurrent_slot_packing_speedup(self):
         inst_serial = [Instance(instance_id="node_serial", device_count=2, slots_per_device=1, remaining_quota_h=30.0)]
-        inst_concurrent = [Instance(instance_id="node_concurrent", device_count=2, slots_per_device=2, remaining_quota_h=30.0)]
+        # Default realistic slowdown (1.30x for 2 workers per GPU)
+        inst_concurrent_realistic = [Instance(instance_id="node_concurrent", device_count=2, slots_per_device=2, remaining_quota_h=30.0)]
+        # Ideal scaling (zero slowdown)
+        inst_concurrent_ideal = [Instance(instance_id="node_ideal", device_count=2, slots_per_device=2, remaining_quota_h=30.0, concurrency_slowdown_factors={1: 1.0, 2: 1.0})]
 
         jobs = [Job(job_id=f"job_{i}", duration_h=1.0, vram_gb=2.0, ram_gb=2.0) for i in range(4)]
 
@@ -93,10 +96,14 @@ class TestAccelPack(unittest.TestCase):
         plan_serial = sched_serial.schedule(jobs, inst_serial)
         self.assertAlmostEqual(plan_serial.global_makespan_h, 2.10, places=2)
 
-        # Concurrent (2 workers per GPU = 4 parallel)
+        # Concurrent with realistic slowdown (1.30x -> makespan 1.30 + 0.10 = 1.40h)
         sched_concurrent = AccelPackScheduler(strategy=PackingStrategy.CONCENTRATE, setup_overhead_h=0.10, slots_per_device=2)
-        plan_concurrent = sched_concurrent.schedule(jobs, inst_concurrent)
-        self.assertAlmostEqual(plan_concurrent.global_makespan_h, 1.10, places=2)
+        plan_concurrent = sched_concurrent.schedule(jobs, inst_concurrent_realistic)
+        self.assertAlmostEqual(plan_concurrent.global_makespan_h, 1.40, places=2)
+
+        # Concurrent with ideal scaling (1.0x -> makespan 1.00 + 0.10 = 1.10h)
+        plan_ideal = sched_concurrent.schedule(jobs, inst_concurrent_ideal)
+        self.assertAlmostEqual(plan_ideal.global_makespan_h, 1.10, places=2)
 
 
 if __name__ == "__main__":

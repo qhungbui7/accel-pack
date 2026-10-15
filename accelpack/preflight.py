@@ -1,6 +1,6 @@
 """Preflight validation pipeline for multi-accelerator fleet scheduling.
 
-Validates compute nodes, quota budgets, reset boundaries, and job feasibility
+Validates compute nodes, account quota pools, reset boundaries, and job feasibility
 prior to scheduling and launch without running expensive on-device diagnostics.
 """
 
@@ -77,7 +77,7 @@ class PreflightValidator:
     ) -> PreflightReport:
         issues: List[PreflightIssue] = []
 
-        # 1. Instance and Quota Checks
+        # 1. Instance and Account-Level Quota Checks
         if not instances:
             issues.append(
                 PreflightIssue(
@@ -88,24 +88,44 @@ class PreflightValidator:
                 )
             )
 
-        total_usable_quota = 0.0
+        # Group instances by account_id to prevent double-counting shared account quotas
+        accounts: Dict[str, List[Instance]] = {}
         for inst in instances:
-            # Check remaining quota vs buffer
-            usable_q = max(0.0, inst.remaining_quota_h - self.min_quota_buffer_h)
+            acc_id = inst.account_id or inst.instance_id
+            accounts.setdefault(acc_id, []).append(inst)
+
+        total_usable_quota = 0.0
+        for acc_id, inst_list in accounts.items():
+            # Check for contradictory quota declarations across instances for the same account
+            quotas = [i.remaining_quota_h for i in inst_list]
+            if max(quotas) - min(quotas) > 1e-3:
+                issues.append(
+                    PreflightIssue(
+                        severity="WARNING",
+                        code="INCONSISTENT_ACCOUNT_QUOTA",
+                        message=f"Instances sharing account '{acc_id}' declare differing remaining quotas: {quotas}.",
+                        target_id=acc_id,
+                        remediation="Synchronize quota balance across all node configurations belonging to this account.",
+                    )
+                )
+
+            account_quota = min(quotas)
+            usable_q = max(0.0, account_quota - self.min_quota_buffer_h)
             total_usable_quota += usable_q
 
-            if inst.remaining_quota_h <= self.min_quota_buffer_h:
+            if account_quota <= self.min_quota_buffer_h:
                 issues.append(
                     PreflightIssue(
                         severity="WARNING",
                         code="QUOTA_BUFFER_EXHAUSTED",
-                        message=f"Remaining quota ({inst.remaining_quota_h:.2f}h) is below safety buffer ({self.min_quota_buffer_h:.2f}h).",
-                        target_id=inst.instance_id,
-                        remediation="Reserve this node for urgent diagnostics or await quota reset window.",
+                        message=f"Account '{acc_id}' remaining quota ({account_quota:.2f}h) is below safety buffer ({self.min_quota_buffer_h:.2f}h).",
+                        target_id=acc_id,
+                        remediation="Reserve this account for emergency diagnostics or await quota reset window.",
                     )
                 )
 
-            # Check reset timestamp if present
+        # Reset timestamp checks
+        for inst in instances:
             if inst.reset_at:
                 try:
                     reset_dt = datetime.fromisoformat(inst.reset_at.replace("Z", "+00:00"))
@@ -116,13 +136,31 @@ class PreflightValidator:
                             PreflightIssue(
                                 severity="INFO",
                                 code="RESET_TIME_PASSED",
-                                message="Reset timestamp has passed; quota may have refreshed.",
+                                message="Reset timestamp has passed; quota balance may have refreshed.",
                                 target_id=inst.instance_id,
                                 remediation="Refresh instance quota observation via API.",
                             )
                         )
+                    elif hours_to_reset < inst.max_session_h:
+                        issues.append(
+                            PreflightIssue(
+                                severity="INFO",
+                                code="SESSION_BOUNDED_BY_RESET",
+                                message=f"Time until quota reset ({hours_to_reset:.2f}h) is shorter than max session cap ({inst.max_session_h:.2f}h).",
+                                target_id=inst.instance_id,
+                                remediation="Ensure scheduled sessions fit within remaining hours before reset.",
+                            )
+                        )
                 except Exception:
-                    pass
+                    issues.append(
+                        PreflightIssue(
+                            severity="WARNING",
+                            code="MALFORMED_RESET_TIMESTAMP",
+                            message=f"Instance declares unparseable reset_at timestamp: '{inst.reset_at}'.",
+                            target_id=inst.instance_id,
+                            remediation="Provide an ISO 8601 formatted timestamp string (e.g. '2026-10-17T00:00:00Z').",
+                        )
+                    )
 
         # 2. Job Validation and Hardware Envelopes
         total_work_h = sum(j.duration_h for j in jobs) if jobs else 0.0
@@ -136,30 +174,53 @@ class PreflightValidator:
                 )
             )
 
-        if total_work_h > total_usable_quota and instances:
-            issues.append(
-                PreflightIssue(
-                    severity="WARNING",
-                    code="FLEET_QUOTA_TIGHT",
-                    message=f"Total workload ({total_work_h:.2f}h) exceeds usable fleet quota ({total_usable_quota:.2f}h).",
-                    remediation="Enable allow_partial=True or partition the workload across multiple reset cycles.",
+        # Plan-compatible quota estimation:
+        # Instead of naively comparing sum of raw worker-hours to quota hours,
+        # calculate estimated billed quota accounting for concurrency across devices.
+        if instances and jobs:
+            total_slots = sum(inst.max_concurrent_workers for inst in instances)
+            # Optimistic concurrent debit: total_work_h / slots * debit_rate
+            avg_debit = sum(inst.debit_rate for inst in instances) / len(instances)
+            est_billed_quota_h = (total_work_h / max(1, total_slots // len(instances))) * avg_debit
+
+            if est_billed_quota_h > total_usable_quota:
+                issues.append(
+                    PreflightIssue(
+                        severity="WARNING",
+                        code="FLEET_QUOTA_TIGHT",
+                        message=(
+                            f"Estimated billed quota ({est_billed_quota_h:.2f}h across {len(jobs)} jobs totaling "
+                            f"{total_work_h:.2f} worker-hours) exceeds usable fleet quota ({total_usable_quota:.2f}h)."
+                        ),
+                        remediation="Enable allow_partial=True or partition the workload across multiple reset cycles.",
+                    )
                 )
-            )
 
         max_instance_vram = max((inst.vram_per_device_gb for inst in instances), default=16.0)
         max_instance_session = max((inst.max_session_h for inst in instances), default=11.0)
 
         for job in jobs:
-            # Check individual job length against session limits
-            if job.duration_h > (max_instance_session * self.max_session_overhead_ratio):
-                if not job.resumable:
+            # Check individual job length against session limits:
+            # Crucial rule: resumable=True does NOT bypass the blocker unless valid checkpoint segments are modeled!
+            session_threshold = max_instance_session * self.max_session_overhead_ratio
+            if job.duration_h > session_threshold:
+                has_valid_segments = (
+                    job.segments is not None
+                    and len(job.segments) > 0
+                    and all(s <= session_threshold for s in job.segments)
+                )
+                if not has_valid_segments:
                     issues.append(
                         PreflightIssue(
                             severity="BLOCKER",
                             code="JOB_EXCEEDS_SESSION_LIMIT",
-                            message=f"Job duration ({job.duration_h:.2f}h) exceeds maximum instance session cap ({max_instance_session:.2f}h) without checkpointing.",
+                            message=(
+                                f"Job duration ({job.duration_h:.2f}h) exceeds maximum instance session cap "
+                                f"({max_instance_session:.2f}h) "
+                                f"{'even though resumable=True (no valid segments fitting session cap defined)' if job.resumable else 'without checkpointing'}."
+                            ),
                             target_id=job.job_id,
-                            remediation="Enable resumable=True with periodic checkpointing or partition steps.",
+                            remediation="Partition job into segments (job.segments) with durations <= session cap or reduce step count.",
                         )
                     )
 
@@ -182,6 +243,7 @@ class PreflightValidator:
             issues=issues,
             summary={
                 "instances_count": len(instances),
+                "accounts_count": len(accounts),
                 "jobs_count": len(jobs),
                 "total_workload_hours": round(total_work_h, 2),
                 "usable_fleet_quota_hours": round(total_usable_quota, 2),
